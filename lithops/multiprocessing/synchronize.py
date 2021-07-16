@@ -12,9 +12,11 @@
 import threading
 import time
 import logging
+import cloudpickle
 
 from . import util
 from . import config as mp_config
+from . import queues
 
 logger = logging.getLogger(__name__)
 
@@ -24,293 +26,915 @@ logger = logging.getLogger(__name__)
 
 SEM_VALUE_MAX = 2 ** 30
 
+if util.load_config()['lithops']['cache'] == 'redis': 
+    #
+    # Base class for semaphores and mutexes
+    #
 
-#
-# Base class for semaphores and mutexes
-#
+    class SemLock:
+        # KEYS[1] - semlock name
+        # ARGV[1] - max value
+        # return new semlock value
+        # only increments its value if
+        # it is not above the max value
+        LUA_RELEASE_SCRIPT = """
+            local current_value = tonumber(redis.call('llen', KEYS[1]))
+            if current_value >= tonumber(ARGV[1]) then
+                return current_value
+            end
+            redis.call('rpush', KEYS[1], '')
+            return current_value + 1
+        """
 
-class SemLock:
-    # KEYS[1] - semlock name
-    # ARGV[1] - max value
-    # return new semlock value
-    # only increments its value if
-    # it is not above the max value
-    LUA_RELEASE_SCRIPT = """
-        local current_value = tonumber(redis.call('llen', KEYS[1]))
-        if current_value >= tonumber(ARGV[1]) then
-            return current_value
-        end
-        redis.call('rpush', KEYS[1], '')
-        return current_value + 1
-    """
+        def __init__(self, value=1, max_value=1):
+            self._name = 'semlock-' + util.get_uuid()
+            self._max_value = max_value
+            self._client = util.get_cache_client()
+            logger.debug('Requested creation of resource Lock %s', self._name)
+            if value != 0:
+                self._client.rpush(self._name, *([''] * value))
+            self._client.expire(self._name, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
 
-    def __init__(self, value=1, max_value=1):
-        self._name = 'semlock-' + util.get_uuid()
-        self._max_value = max_value
-        self._client = util.get_redis_client()
-        logger.debug('Requested creation of resource Lock %s', self._name)
-        if value != 0:
-            self._client.rpush(self._name, *([''] * value))
-        self._client.expire(self._name, mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
+            self._lua_release = self._client.register_script(Semaphore.LUA_RELEASE_SCRIPT)
+            util.make_stateless_script(self._lua_release)
 
-        self._lua_release = self._client.register_script(Semaphore.LUA_RELEASE_SCRIPT)
-        util.make_stateless_script(self._lua_release)
+            self._ref = util.RemoteReference(self._name, client=self._client)
 
-        self._ref = util.RemoteReference(self._name, client=self._client)
+        def __getstate__(self):
+            return (self._name, self._max_value, self._client,
+                    self._lua_release, self._ref)
 
-    def __getstate__(self):
-        return (self._name, self._max_value, self._client,
-                self._lua_release, self._ref)
+        def __setstate__(self, state):
+            (self._name, self._max_value, self._client,
+            self._lua_release, self._ref) = state
 
-    def __setstate__(self, state):
-        (self._name, self._max_value, self._client,
-         self._lua_release, self._ref) = state
+        def __enter__(self):
+            self.acquire()
+            return self
 
-    def __enter__(self):
-        self.acquire()
-        return self
+        def __exit__(self, *args):
+            self.release()
 
-    def __exit__(self, *args):
-        self.release()
+        def get_value(self):
+            value = self._client.llen(self._name)
+            return int(value)
 
-    def get_value(self):
-        value = self._client.llen(self._name)
-        return int(value)
+        def acquire(self, block=True):
+            if block:
+                logger.debug('Requested blocking acquire for lock %s', self._name)
+                self._client.blpop([self._name])
+                return True
+            else:
+                logger.debug('Requested non-blocking acquire for lock %s', self._name)
+                return self._client.lpop(self._name) is not None
 
-    def acquire(self, block=True):
-        if block:
-            logger.debug('Requested blocking acquire for lock %s', self._name)
-            self._client.blpop([self._name])
-            return True
-        else:
-            logger.debug('Requested non-blocking acquire for lock %s', self._name)
-            return self._client.lpop(self._name) is not None
+        def release(self):
+            logger.debug('Requested release for lock %s', self._name)
+            self._lua_release(keys=[self._name],
+                            args=[self._max_value],
+                            client=self._client)
 
-    def release(self):
-        logger.debug('Requested release for lock %s', self._name)
-        self._lua_release(keys=[self._name],
-                          args=[self._max_value],
-                          client=self._client)
-
-    def __repr__(self):
-        try:
-            value = self.get_value()
-        except Exception:
-            value = 'unknown'
-        return '<%s(value=%s)>' % (self.__class__.__name__, value)
-
-
-#
-# Semaphore
-#
-
-class Semaphore(SemLock):
-    def __init__(self, value=1):
-        super().__init__(value, SEM_VALUE_MAX)
+        def __repr__(self):
+            try:
+                value = self.get_value()
+            except Exception:
+                value = 'unknown'
+            return '<%s(value=%s)>' % (self.__class__.__name__, value)
 
 
-#
-# Bounded semaphore
-#
+    #
+    # Semaphore
+    #
 
-class BoundedSemaphore(SemLock):
-    def __init__(self, value=1):
-        super().__init__(value, value)
-
-
-#
-# Non-recursive lock
-#
-
-class Lock(SemLock):
-    def __init__(self):
-        super().__init__(1, 1)
-        self.owned = False
-
-    def __setstate__(self, state):
-        super().__setstate__(state)
-        self.owned = False
-
-    def acquire(self, block=True):
-        res = super().acquire(block)
-        self.owned = True
-        return res
-
-    def release(self):
-        super().release()
-        self.owned = False
+    class Semaphore(SemLock):
+        def __init__(self, value=1):
+            super().__init__(value, SEM_VALUE_MAX)
 
 
-#
-# Recursive lock
-#
+    #
+    # Bounded semaphore
+    #
 
-class RLock(Lock):
-    def acquire(self, block=True):
-        return self.owned or super().acquire(block)
+    class BoundedSemaphore(SemLock):
+        def __init__(self, value=1):
+            super().__init__(value, value)
 
 
-#
-# Condition variable
-#
+    #
+    # Non-recursive lock
+    #
 
-class Condition:
-    def __init__(self, lock=None):
-        if lock:
-            self._lock = lock
-            self._client = util.get_redis_client()
-        else:
-            self._lock = Lock()
-            # help reducing the amount of open clients
-            self._client = self._lock._client
+    class Lock(SemLock):
+        def __init__(self):
+            super().__init__(1, 1)
+            self.owned = False
 
-        self._notify_handle = 'condition-notify-' + util.get_uuid()
-        logger.debug('Requested creation of resource Condition %s', self._notify_handle)
-        self._ref = util.RemoteReference(self._notify_handle,
-                                         client=self._client)
+        def __setstate__(self, state):
+            super().__setstate__(state)
+            self.owned = False
 
-    def acquire(self):
-        return self._lock.acquire()
+        def acquire(self, block=True):
+            res = super().acquire(block)
+            self.owned = True
+            return res
 
-    def release(self):
-        self._lock.release()
+        def release(self):
+            super().release()
+            self.owned = False
 
-    def __enter__(self):
-        return self._lock.__enter__()
 
-    def __exit__(self, *args):
-        return self._lock.__exit__(*args)
+    #
+    # Recursive lock
+    #
 
-    def wait(self, timeout=None):
-        assert self._lock.owned
+    class RLock(Lock):
+        def acquire(self, block=True):
+            return self.owned or super().acquire(block)
 
-        # Enqueue the key we will be waiting for until we are notified
-        wait_handle = 'condition-wait-' + util.get_uuid()
-        res = self._client.rpush(self._notify_handle, wait_handle)
 
-        if not res:
-            raise Exception('Condition ({}) could not enqueue waiting key'.format(self._notify_handle))
+    #
+    # Condition variable
+    #
 
-        # Release lock, wait to get notified, acquire lock
-        self.release()
-        logger.debug('Waiting for token %s on condition %s', wait_handle, self._notify_handle)
-        self._client.blpop([wait_handle], timeout)
-        self._client.expire(wait_handle, mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
-        self.acquire()
+    class Condition:
+        def __init__(self, lock=None):
+            if lock:
+                self._lock = lock
+                self._client = util.get_cache_client()
+            else:
+                self._lock = Lock()
+                # help reducing the amount of open clients
+                self._client = self._lock._client
 
-    def notify(self):
-        assert self._lock.owned
+            self._notify_handle = 'condition-notify-' + util.get_uuid()
+            logger.debug('Requested creation of resource Condition %s', self._notify_handle)
+            self._ref = util.RemoteReference(self._notify_handle,
+                                            client=self._client)
 
-        logger.debug('Notify condition %s', self._notify_handle)
-        wait_handle = self._client.lpop(self._notify_handle)
-        if wait_handle is not None:
-            res = self._client.rpush(wait_handle, '')
+        def acquire(self):
+            return self._lock.acquire()
+
+        def release(self):
+            self._lock.release()
+
+        def __enter__(self):
+            return self._lock.__enter__()
+
+        def __exit__(self, *args):
+            return self._lock.__exit__(*args)
+
+        def wait(self, timeout=None):
+            assert self._lock.owned
+
+            # Enqueue the key we will be waiting for until we are notified
+            wait_handle = 'condition-wait-' + util.get_uuid()
+            res = self._client.rpush(self._notify_handle, wait_handle)
 
             if not res:
-                raise Exception('Condition ({}) could not notify one waiting process'.format(self._notify_handle))
+                raise Exception('Condition ({}) could not enqueue waiting key'.format(self._notify_handle))
 
-    def notify_all(self, msg=''):
-        assert self._lock.owned
+            # Release lock, wait to get notified, acquire lock
+            self.release()
+            logger.debug('Waiting for token %s on condition %s', wait_handle, self._notify_handle)
+            self._client.blpop([wait_handle], timeout)
+            self._client.expire(wait_handle, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+            self.acquire()
 
-        logger.debug('Notify all for condition %s', self._notify_handle)
-        pipeline = self._client.pipeline(transaction=False)
-        pipeline.lrange(self._notify_handle, 0, -1)
-        pipeline.delete(self._notify_handle)
-        wait_handles, _ = pipeline.execute()
+        def notify(self):
+            assert self._lock.owned
 
-        if len(wait_handles) > 0:
+            logger.debug('Notify condition %s', self._notify_handle)
+            wait_handle = self._client.lpop(self._notify_handle)
+            if wait_handle is not None:
+                res = self._client.rpush(wait_handle, '')
+
+                if not res:
+                    raise Exception('Condition ({}) could not notify one waiting process'.format(self._notify_handle))
+
+        def notify_all(self, msg=''):
+            assert self._lock.owned
+
+            logger.debug('Notify all for condition %s', self._notify_handle)
             pipeline = self._client.pipeline(transaction=False)
-            for handle in wait_handles:
-                pipeline.rpush(handle, msg)
-            results = pipeline.execute()
+            pipeline.lrange(self._notify_handle, 0, -1)
+            pipeline.delete(self._notify_handle)
+            wait_handles, _ = pipeline.execute()
 
-            if not all(results):
-                raise Exception('Condition ({}) could not notify all waiting processes'.format(self._notify_handle))
+            if len(wait_handles) > 0:
+                pipeline = self._client.pipeline(transaction=False)
+                for handle in wait_handles:
+                    pipeline.rpush(handle, msg)
+                results = pipeline.execute()
 
-    def wait_for(self, predicate, timeout=None):
-        result = predicate()
-        if result:
-            return result
-        if timeout is not None:
-            endtime = time.monotonic() + timeout
-        else:
-            endtime = None
-            waittime = None
-        while not result:
-            if endtime is not None:
-                waittime = endtime - time.monotonic()
-                if waittime <= 0:
-                    break
-            self.wait(waittime)
+                if not all(results):
+                    raise Exception('Condition ({}) could not notify all waiting processes'.format(self._notify_handle))
+
+        def wait_for(self, predicate, timeout=None):
             result = predicate()
-        return result
+            if result:
+                return result
+            if timeout is not None:
+                endtime = time.monotonic() + timeout
+            else:
+                endtime = None
+                waittime = None
+            while not result:
+                if endtime is not None:
+                    waittime = endtime - time.monotonic()
+                    if waittime <= 0:
+                        break
+                self.wait(waittime)
+                result = predicate()
+            return result
 
 
-#
-# Event
-#
+    #
+    # Event
+    #
 
-class Event:
-    def __init__(self):
-        self._cond = Condition()
-        self._client = self._cond._client
-        self._flag_handle = 'event-flag-' + util.get_uuid()
-        logger.debug('Requested creation of resource Event %s', self._flag_handle)
-        self._ref = util.RemoteReference(self._flag_handle,
-                                         client=self._client)
+    class Event:
+        def __init__(self):
+            self._cond = Condition()
+            self._client = self._cond._client
+            self._flag_handle = 'event-flag-' + util.get_uuid()
+            logger.debug('Requested creation of resource Event %s', self._flag_handle)
+            self._ref = util.RemoteReference(self._flag_handle,
+                                            client=self._client)
 
-    def is_set(self):
-        logger.debug('Request event %s is set', self._flag_handle)
-        return self._client.get(self._flag_handle) == b'1'
+        def is_set(self):
+            logger.debug('Request event %s is set', self._flag_handle)
+            return self._client.get(self._flag_handle) == b'1'
 
-    def set(self):
-        with self._cond:
-            logger.debug('Request set event %s', self._flag_handle)
-            self._client.set(self._flag_handle, '1')
-            self._cond.notify_all()
+        def set(self):
+            with self._cond:
+                logger.debug('Request set event %s', self._flag_handle)
+                self._client.set(self._flag_handle, '1')
+                self._cond.notify_all()
 
-    def clear(self):
-        with self._cond:
-            logger.debug('Request clear event %s', self._flag_handle)
-            self._client.set(self._flag_handle, '0')
+        def clear(self):
+            with self._cond:
+                logger.debug('Request clear event %s', self._flag_handle)
+                self._client.set(self._flag_handle, '0')
 
-    def wait(self, timeout=None):
-        with self._cond:
-            logger.debug('Request wait for event %s', self._flag_handle)
-            self._cond.wait_for(self.is_set, timeout)
+        def wait(self, timeout=None):
+            with self._cond:
+                logger.debug('Request wait for event %s', self._flag_handle)
+                self._cond.wait_for(self.is_set, timeout)
 
 
-#
-# Barrier
-#
+    #
+    # Barrier
+    #
 
-class Barrier(threading.Barrier):
-    def __init__(self, parties, action=None, timeout=None):
-        self._cond = Condition()
-        self._client = self._cond._client
-        uuid = util.get_uuid()
-        self._state_handle = 'barrier-state-' + uuid
-        self._count_handle = 'barrier-count-' + uuid
-        self._ref = util.RemoteReference(referenced=[self._state_handle, self._count_handle],
-                                         client=self._client)
-        self._action = action
-        self._timeout = timeout
-        self._parties = parties
-        self._state = 0  # 0 = filling, 1 = draining, -1 = resetting, -2 = broken
-        self._count = 0
+    class Barrier(threading.Barrier):
+        def __init__(self, parties, action=None, timeout=None):
+            self._cond = Condition()
+            self._client = self._cond._client
+            uuid = util.get_uuid()
+            self._state_handle = 'barrier-state-' + uuid
+            self._count_handle = 'barrier-count-' + uuid
+            self._ref = util.RemoteReference(referenced=[self._state_handle, self._count_handle],
+                                            client=self._client)
+            self._action = action
+            self._timeout = timeout
+            self._parties = parties
+            self._state = 0  # 0 = filling, 1 = draining, -1 = resetting, -2 = broken
+            self._count = 0
 
-    @property
-    def _state(self):
-        return int(self._client.get(self._state_handle))
+        @property
+        def _state(self):
+            return int(self._client.get(self._state_handle))
 
-    @_state.setter
-    def _state(self, value):
-        self._client.set(self._state_handle, value, ex=mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
+        @_state.setter
+        def _state(self, value):
+            self._client.set(self._state_handle, value, ex=mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
 
-    @property
-    def _count(self):
-        return int(self._client.get(self._count_handle))
+        @property
+        def _count(self):
+            return int(self._client.get(self._count_handle))
 
-    @_count.setter
-    def _count(self, value):
-        self._client.set(self._count_handle, value, ex=mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
+        @_count.setter
+        def _count(self, value):
+            self._client.set(self._count_handle, value, ex=mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+
+
+elif util.load_config()['lithops']['cache'] == 'redis2': 
+    #
+    # Base class for semaphores and mutexes
+    #
+
+    class SemLock:
+        # KEYS[1] - semlock name
+        # ARGV[1] - max value
+        # return new semlock value
+        # only increments its value if
+        # it is not above the max value
+
+        def __init__(self, value=1, max_value=1):
+            self._name = 'semlock-' + util.get_uuid()
+            self._max_value = max_value
+            self.queue = queues.Queue()
+            logger.debug('Requested creation of resource Lock %s', self._name)
+            if value != 0:
+                n = 0
+                while n !=value:
+                    self.queue.put(0)
+                    n+=1
+            #self._ref = util.RemoteReference(self._name, client=self._client)
+
+        def __getstate__(self):
+            return (self._name, self._max_value, self._client, self._ref)
+
+        def __setstate__(self, state):
+            (self._name, self._max_value, self._client, self._ref) = state
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *args):
+            self.release()
+
+        def get_value(self):
+            value = self.queue.qsize()
+            return int(value)
+
+        def acquire(self, block=True):
+            if block:
+                logger.debug('Requested blocking acquire for lock %s', self._name)
+                self.queue.get(block)
+                return True
+            else:
+                logger.debug('Requested non-blocking acquire for lock %s', self._name)
+                return self.queue.get()
+
+        def release(self, n):
+            logger.debug('Requested release for lock %s', self._name)
+            c = 0
+            while c !=n:
+                self.queue.put(0)
+                c+=1
+
+        def __repr__(self):
+            try:
+                value = self.get_value()
+            except Exception:
+                value = 'unknown'
+            return '<%s(value=%s)>' % (self.__class__.__name__, value)
+
+
+    #
+    # Semaphore
+    #
+
+    class Semaphore(SemLock):
+        def __init__(self, value=1):
+            super().__init__(value, SEM_VALUE_MAX)
+
+
+    #
+    # Bounded semaphore
+    #
+
+    class BoundedSemaphore(SemLock):
+        def __init__(self, value=1):
+            super().__init__(value, value)
+
+
+    #
+    # Non-recursive lock
+    #
+
+    class Lock(SemLock):
+        def __init__(self):
+            super().__init__(1, 1)
+            self.owned = False
+
+        def __setstate__(self, state):
+            super().__setstate__(state)
+            self.owned = False
+
+        def acquire(self, block=True):
+            res = super().acquire(block)
+            self.owned = True
+            return res
+
+        def release(self):
+            super().release()
+            self.owned = False
+
+
+    #
+    # Recursive lock
+    #
+
+    class RLock(Lock):
+        def acquire(self, block=True):
+            return self.owned or super().acquire(block)
+
+
+    #
+    # Condition variable
+    #
+
+    class Condition:
+        def __init__(self, lock=None):
+            if lock:
+                self._lock = lock
+                #self._client = util.get_cache_client()
+                self._queue = queue.Queue()
+            else:
+                self._lock = Lock()
+                # help reducing the amount of open clients
+                #self._client = self._lock._client
+                self._queue = queue.Queue()
+
+            self._notify_handle = 'condition-notify-' + util.get_uuid()
+            logger.debug('Requested creation of resource Condition %s', self._notify_handle)
+            #self._ref = util.RemoteReference(self._notify_handle,client=self._client)
+
+        def acquire(self):
+            return self._lock.acquire()
+
+        def release(self):
+            self._lock.release()
+
+        def __enter__(self):
+            return self._lock.__enter__()
+
+        def __exit__(self, *args):
+            return self._lock.__exit__(*args)
+
+        def wait(self, timeout=None):
+            assert self._lock.owned
+
+            # Enqueue the key we will be waiting for until we are notified
+            wait_handle = 'condition-wait-' + util.get_uuid()
+            #res = self._client.rpush(self._notify_handle, wait_handle)
+
+
+            if not res:
+                raise Exception('Condition ({}) could not enqueue waiting key'.format(self._notify_handle))
+
+            # Release lock, wait to get notified, acquire lock
+            self.release()
+            logger.debug('Waiting for token %s on condition %s', wait_handle, self._notify_handle)
+            self._client.blpop([wait_handle], timeout)
+            #self._client.expire(wait_handle, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+            self._client.expire(wait_handle, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+            self.acquire()
+
+        def notify(self):
+            assert self._lock.owned
+
+            logger.debug('Notify condition %s', self._notify_handle)
+            wait_handle = self._client.lpop(self._notify_handle)
+            if wait_handle is not None:
+                res = self._client.rpush(wait_handle, '')
+
+                if not res:
+                    raise Exception('Condition ({}) could not notify one waiting process'.format(self._notify_handle))
+
+        def notify_all(self, msg=''):
+            assert self._lock.owned
+
+            logger.debug('Notify all for condition %s', self._notify_handle)
+            pipeline = self._client.pipeline(transaction=False)
+            pipeline.lrange(self._notify_handle, 0, -1)
+            pipeline.delete(self._notify_handle)
+            wait_handles, _ = pipeline.execute()
+
+            if len(wait_handles) > 0:
+                pipeline = self._client.pipeline(transaction=False)
+                for handle in wait_handles:
+                    pipeline.rpush(handle, msg)
+                results = pipeline.execute()
+
+                if not all(results):
+                    raise Exception('Condition ({}) could not notify all waiting processes'.format(self._notify_handle))
+
+        def wait_for(self, predicate, timeout=None):
+            result = predicate()
+            if result:
+                return result
+            if timeout is not None:
+                endtime = time.monotonic() + timeout
+            else:
+                endtime = None
+                waittime = None
+            while not result:
+                if endtime is not None:
+                    waittime = endtime - time.monotonic()
+                    if waittime <= 0:
+                        break
+                self.wait(waittime)
+                result = predicate()
+            return result
+
+
+    #
+    # Event
+    #
+
+    class Event:
+        def __init__(self):
+            self._cond = Condition()
+            self._client = self._cond._client
+            self._flag_handle = 'event-flag-' + util.get_uuid()
+            logger.debug('Requested creation of resource Event %s', self._flag_handle)
+            #self._ref = util.RemoteReference(self._flag_handle,client=self._client)
+
+        def is_set(self):
+            logger.debug('Request event %s is set', self._flag_handle)
+            return self._client.get(self._flag_handle) == b'1'
+
+        def set(self):
+            with self._cond:
+                logger.debug('Request set event %s', self._flag_handle)
+                self._client.set(self._flag_handle, '1')
+                self._cond.notify_all()
+
+        def clear(self):
+            with self._cond:
+                logger.debug('Request clear event %s', self._flag_handle)
+                self._client.set(self._flag_handle, '0')
+
+        def wait(self, timeout=None):
+            with self._cond:
+                logger.debug('Request wait for event %s', self._flag_handle)
+                self._cond.wait_for(self.is_set, timeout)
+
+
+    #
+    # Barrier
+    #
+
+    class Barrier(threading.Barrier):
+        def __init__(self, parties, action=None, timeout=None):
+            self._cond = Condition()
+            self._client = self._cond._client
+            uuid = util.get_uuid()
+            self._state_handle = 'barrier-state-' + uuid
+            self._count_handle = 'barrier-count-' + uuid
+            #self._ref = util.RemoteReference(referenced=[self._state_handle, self._count_handle],client=self._client)
+            self._action = action
+            self._timeout = timeout
+            self._parties = parties
+            self._state = 0  # 0 = filling, 1 = draining, -1 = resetting, -2 = broken
+            self._count = 0
+
+        @property
+        def _state(self):
+            return int(self._client.get(self._state_handle))
+
+        @_state.setter
+        def _state(self, value):
+            #self._client.set(self._state_handle, value, ex=mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+            self._client.set(self._state_handle, value, ex=mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+
+        @property
+        def _count(self):
+            return int(self._client.get(self._count_handle))
+
+        @_count.setter
+        def _count(self, value):
+            #self._client.set(self._count_handle, value, ex=mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+            self._client.set(self._count_handle, value, ex=mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+
+elif util.load_config()['lithops']['cache'] == 'memcached':
+
+    #
+    # Base class for semaphores and mutexes
+    #
+
+    class SemLock:
+
+        def __init__(self, value=1, max_value=1):
+            self._name = 'semlock-' + util.get_uuid()
+            self._max_value = max_value
+            #self._client = util.get_cache_client()
+            self._client = util.get_cache_client()
+            
+            logger.debug('Requested creation of resource Lock %s', self._name)
+            if value != 0:
+                self._client.set(self._name, cloudpickle.dumps([''] * value))
+
+            self._ref = util.RemoteReference(self._name, client=self._client)
+
+        def __getstate__(self):
+            return (self._name, self._max_value, self._client,self._ref)
+
+        def __setstate__(self, state):
+            (self._name, self._max_value, self._client, self._ref) = state
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *args):
+            self.release()
+
+        def get_value(self):
+            return len(cloudpickle.loads(self._client.get(self._name)))
+
+        def acquire(self, block=True):
+            if block:
+                logger.debug('Requested blocking acquire for lock %s', self._name)
+                temp = cloudpickle.loads(self._client.get(self._name))
+                self._client.set('old_len', len(temp))
+                self._client.set('new_len', len(temp))
+                while len(temp) == 0:
+                    time.sleep(0.1)
+                    old_len = cloudpickle.loads(self._client.get('old_len'))
+                    new_len = cloudpickle.loads(self._client.get('new_len'))
+                    if old_len == new_len > 0:
+                        self._client.set('new_len', -1)
+                        temp = cloudpickle.loads(self._client.get(self._name))
+                        temp.pop()
+                        self._client.set(self._name, cloudpickle.dumps(temp))
+                #self._client.blpop([self._name])
+                return True
+            else:
+                logger.debug('Requested non-blocking acquire for lock %s', self._name)
+                temp = cloudpickle.loads(self._client.get(self._name))
+                value = temp.pop()
+                self._client.set(self._name, cloudpickle.dumps(temp))
+                #return self._client.lpop(self._name) is not None
+
+        def release(self):
+            logger.debug('Requested release for lock %s', self._name)
+            temp = cloudpickle.loads(self._client.get(self._name))
+            self._client.set('new_len', len(temp)+1)
+            temp.append('')
+            self._client.set(self._name, cloudpickle.dumps(temp))
+            self._client.set('old_len', len(temp))
+            
+            # KEYS[1] - semlock name
+            # ARGV[1] - max value
+            # return new semlock value
+            # only increments its value if
+            # it is not above the max value
+            """
+                local current_value = tonumber(redis.call('llen', KEYS[1]))
+                if current_value >= tonumber(ARGV[1]) then
+                    return current_value
+                end
+                redis.call('rpush', KEYS[1], '')
+                return current_value + 1
+            """
+
+        def __repr__(self):
+            try:
+                value = self.get_value()
+            except Exception:
+                value = 'unknown'
+            return '<%s(value=%s)>' % (self.__class__.__name__, value)
+
+
+    #
+    # Semaphore
+    #
+
+    class Semaphore(SemLock):
+        def __init__(self, value=1):
+            super().__init__(value, SEM_VALUE_MAX)
+            
+
+
+    #
+    # Bounded semaphore
+    #
+
+    class BoundedSemaphore(SemLock):
+        def __init__(self, value=1):
+            super().__init__(value, value)
+
+
+    #
+    # Non-recursive lock
+    #
+
+    class Lock(SemLock):
+        def __init__(self):
+            super().__init__(1, 1)
+            self.owned = False
+
+        def __setstate__(self, state):
+            super().__setstate__(state)
+            self.owned = False
+
+        def acquire(self, block=True):
+            res = super().acquire(block)
+            self.owned = True
+            return res
+
+        def release(self):
+            super().release()
+            self.owned = False
+
+
+    #
+    # Recursive lock
+    #
+
+    class RLock(Lock):
+        def acquire(self, block=True):
+            return self.owned or super().acquire(block)
+
+
+    #
+    # Condition variable
+    #
+
+    class Condition:
+        def __init__(self, lock=None):
+            if lock:
+                self._lock = lock
+                #self._client = util.get_cache_client()
+                self._client = util.get_cache_client()
+            else:
+                self._lock = Lock()
+                # help reducing the amount of open clients
+                self._client = self._lock._client
+
+            self._notify_handle = 'condition-notify-' + util.get_uuid()
+            logger.debug('Requested creation of resource Condition %s', self._notify_handle)
+            self._ref = util.RemoteReference(self._notify_handle,
+                                            client=self._client)
+
+        def acquire(self):
+            return self._lock.acquire()
+
+        def release(self):
+            self._lock.release()
+
+        def __enter__(self):
+            return self._lock.__enter__()
+
+        def __exit__(self, *args):
+            return self._lock.__exit__(*args)
+
+        def wait(self, timeout=None):
+            assert self._lock.owned
+
+            # Enqueue the key we will be waiting for until we are notified
+
+
+
+            wait_handle = 'condition-wait-' + util.get_uuid()
+            current = cloudpickle.loads(self._client.get(self._notify_handle))
+            current.append(wait_handle)
+            self._client.set(self._notify_handle, cloudpickle.dumps(current))
+
+            res = len(current)
+
+            if not res:
+                raise Exception('Condition ({}) could not enqueue waiting key'.format(self._notify_handle))
+
+            # Release lock, wait to get notified, acquire lock
+            self.release()
+            logger.debug('Waiting for token %s on condition %s', wait_handle, self._notify_handle)
+            temp = cloudpickle.loads(self._client.get(self._name))
+            self._client.set('old_len', len(temp))
+            self._client.set('new_len', len(temp))
+            while len(temp) == 0:
+                time.sleep(0.1)
+                old_len = cloudpickle.loads(self._client.get('old_len'))
+                new_len = cloudpickle.loads(self._client.get('new_len'))
+                if old_len == new_len > 0:
+                    self._client.set('new_len', -1)
+                    temp = cloudpickle.loads(self._client.get(self.wait_handle))
+                    temp.pop()
+                    self._client.set(self.wait_handle, cloudpickle.dumps(temp))
+
+            #self._client.blpop([wait_handle], timeout)
+            self.acquire()
+
+        def notify(self):
+            assert self._lock.owned
+
+            logger.debug('Notify condition %s', self._notify_handle)
+            temp = cloudpickle.loads(self._client.get(self._notify_handle))
+            self._client.set('new_len', len(temp)+1)
+            wait_handle = temp.pop()
+            self._client.set(self._notify_handle, cloudpickle.dumps(temp))
+            self._client.set('old_len', len(temp))
+
+            if wait_handle is not None:
+                current = cloudpickle.loads(self._client.get(self._notify_handle))
+                current.extend('')
+                res = len(current)
+                self._client.set(self._notify_handle, cloudpickle.dumps(current))
+
+                if not res:
+                    raise Exception('Condition ({}) could not notify one waiting process'.format(self._notify_handle))
+
+        def notify_all(self, msg=''):
+            assert self._lock.owned
+
+            logger.debug('Notify all for condition %s', self._notify_handle)
+            temp = cloudpickle.loads(self._client.get(self._notify_handle))
+            self._client.set('new_len', len(temp)+1)
+            wait_handle = temp
+            self._client.set(self._notify_handle, cloudpickle.dumps(temp))
+            self._client.set('old_len', len(temp))
+
+            if len(wait_handles) > 0:
+                pipeline = self._client.pipeline(transaction=False)
+                for handle in wait_handles:
+                    pipeline.rpush(handle, msg)
+                results = pipeline.execute()
+
+                if not all(results):
+                    raise Exception('Condition ({}) could not notify all waiting processes'.format(self._notify_handle))
+
+        def wait_for(self, predicate, timeout=None):
+            result = predicate()
+            if result:
+                return result
+            if timeout is not None:
+                endtime = time.monotonic() + timeout
+            else:
+                endtime = None
+                waittime = None
+            while not result:
+                if endtime is not None:
+                    waittime = endtime - time.monotonic()
+                    if waittime <= 0:
+                        break
+                self.wait(waittime)
+                result = predicate()
+            return result
+
+
+    #
+    # Event
+    #
+
+    class Event:
+        def __init__(self):
+            self._cond = Condition()
+            self._client = self._cond._client
+            
+            self._flag_handle = 'event-flag-' + util.get_uuid()
+            logger.debug('Requested creation of resource Event %s', self._flag_handle)
+            self._ref = util.RemoteReference(self._flag_handle,
+                                            client=self._client)
+
+        def is_set(self):
+            logger.debug('Request event %s is set', self._flag_handle)
+            return cloudpickle.loads(self._client.get(self._flag_handle)) == b'1'
+
+        def set(self):
+            with self._cond:
+                logger.debug('Request set event %s', self._flag_handle)
+                self._client.set(self._flag_handle, cloudpickle.dumps('1'))
+                self._cond.notify_all()
+
+        def clear(self):
+            with self._cond:
+                logger.debug('Request clear event %s', self._flag_handle)
+                self._client.set(self._flag_handle, cloudpickle.dumps('0'))
+
+        def wait(self, timeout=None):
+            with self._cond:
+                logger.debug('Request wait for event %s', self._flag_handle)
+                self._cond.wait_for(self.is_set, timeout)
+
+
+    #
+    # Barrier
+    #
+
+    class Barrier(threading.Barrier):
+        def __init__(self, parties, action=None, timeout=None):
+            self._cond = Condition()
+            self._client = self._cond._client
+            
+            uuid = util.get_uuid()
+            self._state_handle = 'barrier-state-' + uuid
+            self._count_handle = 'barrier-count-' + uuid
+            self._ref = util.RemoteReference(referenced=[self._state_handle, self._count_handle],
+                                            client=self._client)
+            self._action = action
+            self._timeout = timeout
+            self._parties = parties
+            self._state = 0  # 0 = filling, 1 = draining, -1 = resetting, -2 = broken
+            self._count = 0
+
+        @property
+        def _state(self):
+            return int(cloudpickle.loads(self._client.get(self._state_handle)))
+
+        @_state.setter
+        def _state(self, value):
+            self._client.set(self._state_handle, cloudpickle.dumps(value))
+
+        @property
+        def _count(self):
+            return int(cloudpickle.loads(self._client.get(self._count_handle)))
+
+        @_count.setter
+        def _count(self, value):
+            self._client.set(self._count_handle, cloudpickle.dumps(value))
+
