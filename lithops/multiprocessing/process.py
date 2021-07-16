@@ -149,7 +149,7 @@ class CloudProcess:
         self._future = None
         self._sentinel = object()
         self._remote_logger = None
-        self._redis = util.get_redis_client()
+        self._cache = util.get_cache_client()
 
     def run(self):
         """

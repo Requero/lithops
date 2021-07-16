@@ -11,6 +11,8 @@
 import traceback
 import weakref
 import redis
+import pymemcache
+import cloudpickle
 import uuid
 import logging
 import sys
@@ -34,6 +36,7 @@ class PicklableRedis(redis.StrictRedis):
     def __init__(self, *args, **kwargs):
         self._args = args
         self._kwargs = kwargs
+        self._type = 'redis'
         logger.debug('Creating picklable Redis client')
         super().__init__(*self._args, **self._kwargs)
 
@@ -42,15 +45,44 @@ class PicklableRedis(redis.StrictRedis):
 
     def __setstate__(self, state):
         self.__init__(*state[0], **state[1])
+    
+    def get_type(self):
+        return self._type
 
+#
+# Picklable memcached client
+#
 
-def get_redis_client(**overwrites):
+class PicklableMemcached(pymemcache.Client):
+    def __init__(self, *args, **kwargs):
+        self._args = args
+        self._kwargs = kwargs
+        self._type = 'redis'
+        logger.debug('Creating picklable Memcached client')
+        super().__init__(*self._args, **self._kwargs)
+
+    def __getstate__(self):
+        return self._args, self._kwargs
+
+    def __setstate__(self, state):
+        self.__init__(*state[0], **state[1])
+    
+    def get_type(self):
+        return self._type
+
+def get_cache_client(**overwrites):
     try:
-        conn_params = load_config()['redis']
+        if 'redis' in load_config()['lithops']['cache'] :
+            conn_params = load_config()['redis']
+        if 'memcached' in load_config()['lithops']['cache'] :
+            conn_params = load_config()['memcached']
     except KeyError:
         raise Exception('Redis section not found in you config')
     conn_params.update(overwrites)
-    return PicklableRedis(**conn_params)
+    if 'redis' in load_config()['lithops']['cache'] :
+        return PicklableRedis(**conn_params)
+    if 'memcached' in load_config()['lithops']['cache'] :
+        return PicklableMemcached((conn_params['host'],conn_params['port']))
 
 
 #
@@ -92,155 +124,326 @@ def get_network_ip():
     s.connect(('<broadcast>', 0))
     return s.getsockname()[0]
 
+if 'redis' in load_config()['lithops']['cache']:
 
-#
-# object for counting remote references (redis keys)
-# and garbage collect them automatically when nothing
-# is pointing at them
-#
+    #
+    # object for counting remote references (redis keys)
+    # and garbage collect them automatically when nothing
+    # is pointing at them
+    #
 
-class RemoteReference:
-    def __init__(self, referenced, managed=False, client=None):
-        if isinstance(referenced, str):
-            referenced = [referenced]
-        if not isinstance(referenced, list):
-            raise TypeError("referenced must be a key (str) or"
-                            "a list of keys")
-        self._referenced = referenced
+    class RemoteReference:
+        def __init__(self, referenced, managed=False, client=None):
+            if isinstance(referenced, str):
+                referenced = [referenced]
+            if not isinstance(referenced, list):
+                raise TypeError("referenced must be a key (str) or"
+                                "a list of keys")
+            self._referenced = referenced
 
-        # reference counter key
-        self._rck = '{}-{}'.format('ref', self._referenced[0])
-        self._referenced.append(self._rck)
-        self._client = client or get_redis_client()
+            # reference counter key
+            self._rck = '{}-{}'.format('ref', self._referenced[0])
+            self._referenced.append(self._rck)
+            self._client = client or get_cache_client()
 
-        self._callback = None
-        self.managed = managed
-
-    @property
-    def managed(self):
-        return self._callback is None
-
-    @managed.setter
-    def managed(self, value):
-        managed = value
-
-        if self._callback is not None:
-            self._callback.atexit = False
-            self._callback.detach()
-
-        if managed:
             self._callback = None
-        else:
-            self._callback = weakref.finalize(self, type(self)._finalize,
-                                              self._client, self._rck, self._referenced)
+            self.managed = managed
 
-    def __getstate__(self):
-        return (self._rck, self._referenced,
-                self._client, self.managed)
+        @property
+        def managed(self):
+            return self._callback is None
 
-    def __setstate__(self, state):
-        (self._rck, self._referenced,
-         self._client) = state[:-1]
-        self._callback = None
-        self.managed = state[-1]
-        self.incref()
+        @managed.setter
+        def managed(self, value):
+            managed = value
 
-    def incref(self):
-        if not self.managed:
-            pipeline = self._client.pipeline()
-            pipeline.incr(self._rck, 1)
-            pipeline.expire(self._rck, mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
-            counter, _ = pipeline.execute()
-            return int(counter)
+            if self._callback is not None:
+                self._callback.atexit = False
+                self._callback.detach()
 
-    def decref(self):
-        if not self.managed:
-            pipeline = self._client.pipeline()
-            pipeline.decr(self._rck, 1)
-            pipeline.expire(self._rck, mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
-            counter, _ = pipeline.execute()
-            return int(counter)
+            if managed:
+                self._callback = None
+            else:
+                self._callback = weakref.finalize(self, type(self)._finalize,
+                                                self._client, self._rck, self._referenced)
 
-    def refcount(self):
-        count = self._client.get(self._rck)
-        return 1 if count is None else int(count) + 1
+        def __getstate__(self):
+            return (self._rck, self._referenced,
+                    self._client, self.managed)
 
-    def collect(self):
-        if len(self._referenced) > 0:
-            self._client.delete(*self._referenced)
-            self._referenced = []
+        def __setstate__(self, state):
+            (self._rck, self._referenced,
+            self._client) = state[:-1]
+            self._callback = None
+            self.managed = state[-1]
+            self.incref()
 
-    @staticmethod
-    def _finalize(client, rck, referenced):
-        count = int(client.decr(rck, 1))
-        if count < 0 and len(referenced) > 0:
-            client.delete(*referenced)
+        def incref(self):
+            if not self.managed:
+                pipeline = self._client.pipeline()
+                pipeline.incr(self._rck, 1)
+                pipeline.expire(self._rck, mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
+                counter, _ = pipeline.execute()
+                return int(counter)
 
+        def decref(self):
+            if not self.managed:
+                pipeline = self._client.pipeline()
+                pipeline.decr(self._rck, 1)
+                pipeline.expire(self._rck, mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
+                counter, _ = pipeline.execute()
+                return int(counter)
 
-#
-# Remote logging
-#
+        def refcount(self):
+            count = self._client.get(self._rck)
+            return 1 if count is None else int(count) + 1
 
-class RemoteLogIOBuffer:
-    def __init__(self, stream):
-        self._feeder_thread = threading
-        self._buff = io.StringIO()
-        self._redis = get_redis_client()
-        self._stream = stream
-        self._offset = 0
+        def collect(self):
+            if len(self._referenced) > 0:
+                self._client.delete(*self._referenced)
+                self._referenced = []
 
-    def write(self, log):
-        self._buff.write(log)
-        # self.flush()
-        self._old_stdout.write(log)
-
-    def flush(self):
-        self._buff.seek(self._offset)
-        log = self._buff.read()
-        logger.debug('Flush remote logging stream (len %i)', len(log))
-        self._redis.publish(self._stream, log)
-        self._offset = self._buff.tell()
-        # self._buff = io.StringIO()
-        # FIXME flush() does not empty the buffer?
-        self._buff.flush()
-
-    def start(self):
-        import sys
-        self._old_stdout = sys.stdout
-        sys.stdout = self
-        logger.debug('Starting remote logging feed to stream %s', self._stream)
-
-    def stop(self):
-        import sys
-        sys.stdout = self._old_stdout
-        logger.debug('Stopping remote logging feed to stream %s', self._stream)
+        @staticmethod
+        def _finalize(client, rck, referenced):
+            count = int(client.decr(rck, 1))
+            if count < 0 and len(referenced) > 0:
+                client.delete(*referenced)
 
 
-class RemoteLoggingFeed:
-    def __init__(self, stream):
-        self._logger_thread = threading.Thread(target=self._logger_monitor, args=(stream,))
-        self._stream = stream
-        self._enabled = False
+    #
+    # Remote logging
+    #
 
-    def _logger_monitor(self, stream):
-        logger.debug('Starting logger feeder thread for stream %s', stream)
-        redis_pubsub = get_redis_client().pubsub()
-        redis_pubsub.subscribe(stream)
+    class RemoteLogIOBuffer:
+        def __init__(self, stream):
+            self._feeder_thread = threading
+            self._buff = io.StringIO()
+            self._redis = get_cache_client()
+            self._stream = stream
+            self._offset = 0
 
-        while self._enabled:
-            msg = redis_pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
-            if msg is None:
-                continue
-            if 'data' in msg:
-                sys.stdout.write(msg['data'].decode('utf-8'))
+        def write(self, log):
+            self._buff.write(log)
+            # self.flush()
+            self._old_stdout.write(log)
 
-        logger.debug('Logger monitor thread for stream %s finished', stream)
+        def flush(self):
+            self._buff.seek(self._offset)
+            log = self._buff.read()
+            logger.debug('Flush remote logging stream (len %i)', len(log))
+            self._redis.publish(self._stream, log)
+            self._offset = self._buff.tell()
+            # self._buff = io.StringIO()
+            # FIXME flush() does not empty the buffer?
+            self._buff.flush()
 
-    def start(self):
-        # self._logger_thread.daemon = True
-        self._enabled = True
-        self._logger_thread.start()
+        def start(self):
+            import sys
+            self._old_stdout = sys.stdout
+            sys.stdout = self
+            logger.debug('Starting remote logging feed to stream %s', self._stream)
 
-    def stop(self):
-        self._enabled = False
-        self._logger_thread.join(5)
+        def stop(self):
+            import sys
+            sys.stdout = self._old_stdout
+            logger.debug('Stopping remote logging feed to stream %s', self._stream)
+
+
+    class RemoteLoggingFeed:
+        def __init__(self, stream):
+            self._logger_thread = threading.Thread(target=self._logger_monitor, args=(stream,))
+            self._stream = stream
+            self._enabled = False
+
+        def _logger_monitor(self, stream):
+            logger.debug('Starting logger feeder thread for stream %s', stream)
+            redis_pubsub = get_cache_client().pubsub()
+            redis_pubsub.subscribe(stream)
+
+            while self._enabled:
+                msg = redis_pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
+                if msg is None:
+                    continue
+                if 'data' in msg:
+                    sys.stdout.write(msg['data'].decode('utf-8'))
+
+            logger.debug('Logger monitor thread for stream %s finished', stream)
+
+        def start(self):
+            # self._logger_thread.daemon = True
+            self._enabled = True
+            self._logger_thread.start()
+
+        def stop(self):
+            self._enabled = False
+            self._logger_thread.join(5)
+
+
+elif 'memcached' in load_config()['lithops']['cache']:
+
+    #
+    # object for counting remote references (redis keys)
+    # and garbage collect them automatically when nothing
+    # is pointing at them
+    #
+
+    class RemoteReference:
+        def __init__(self, referenced, managed=False, client=None):
+            if isinstance(referenced, str):
+                referenced = [referenced]
+            if not isinstance(referenced, list):
+                raise TypeError("referenced must be a key (str) or"
+                                "a list of keys")
+            self._referenced = referenced
+
+            # reference counter key
+            self._rck = '{}-{}'.format('ref', self._referenced[0])
+            self._referenced.append(self._rck)
+            #self._client = client or get_redis_client()
+            self._client = client or get_cache_client()
+
+            self._callback = None
+            self.managed = managed
+
+        @property
+        def managed(self):
+            return self._callback is None
+
+        @managed.setter
+        def managed(self, value):
+            managed = value
+
+            if self._callback is not None:
+                self._callback.atexit = False
+                self._callback.detach()
+
+            if managed:
+                self._callback = None
+            else:
+                self._callback = weakref.finalize(self, type(self)._finalize,
+                                                self._client, self._rck, self._referenced)
+
+        def __getstate__(self):
+            return (self._rck, self._referenced,
+                    self._client, self.managed)
+
+        def __setstate__(self, state):
+            (self._rck, self._referenced,
+            self._client) = state[:-1]
+            self._callback = None
+            self.managed = state[-1]
+            self._client.set(self._rck, cloudpickle.dumps(1))
+            self.incref()
+
+        def incref(self):
+            if not self.managed:
+                temp = self._client.get(self._rck)
+                if temp == None:
+                    n = 1
+                else:
+                    n = cloudpickle.loads(temp)
+                    n += 1
+                self._client.set(self._rck, cloudpickle.dumps(n))
+                return n
+
+        def decref(self):
+            if not self.managed:
+                temp = self._client.get(self._rck)
+                if temp == None:
+                    n = 1
+                else:
+                    n = cloudpickle.loads(temp)
+                    n -= 1
+                self._client.set(self._rck, cloudpickle.dumps(n))
+                return n
+
+        def refcount(self):
+            count = self._client.get(self._rck)
+            return 1 if count is None else int(count) + 1
+
+        def collect(self):
+            if len(self._referenced) > 0:
+                self._client.delete(*self._referenced)
+                self._referenced = []
+
+        @staticmethod
+        def _finalize(client, rck, referenced):
+            #count = cloudpickle.loads(client.get(rck))
+            #count -=1
+            #client.set(rck, cloudpickle.dumps(count))
+            #if count < 0 and len(referenced) > 0:
+            #    for key in referenced:
+            #        client.delete(key)
+            pass
+
+
+    #
+    # Remote logging
+    #
+
+    class RemoteLogIOBuffer:
+        def __init__(self, stream):
+            self._feeder_thread = threading
+            self._buff = io.StringIO()
+            #self._redis = get_redis_client()
+            self._client = get_cache_client()
+            self._stream = stream
+            self._offset = 0
+
+        def write(self, log):
+            self._buff.write(log)
+            # self.flush()
+            self._old_stdout.write(log)
+
+        def flush(self):
+            self._buff.seek(self._offset)
+            log = self._buff.read()
+            #self._redis.publish(self._stream, log)
+            self._client.publish(self._stream, log)
+            self._offset = self._buff.tell()
+            # self._buff = io.StringIO()
+            # FIXME flush() does not empty the buffer?
+            self._buff.flush()
+
+        def start(self):
+            import sys
+            self._old_stdout = sys.stdout
+            sys.stdout = self
+
+        def stop(self):
+            import sys
+            sys.stdout = self._old_stdout
+
+
+    class RemoteLoggingFeed:
+        def __init__(self, stream):
+            self._logger_thread = threading.Thread(target=self._logger_monitor, args=(stream,))
+            self._stream = stream
+            self._enabled = False
+
+        def _logger_monitor(self, stream):
+            logger.debug('Starting logger monitor thread for stream {}'.format(stream))
+            #redis_pubsub = get_redis_client().pubsub()
+            #redis_pubsub.subscribe(stream)
+            cache_pubsub = get_cache_client().pubsub()
+            cache_pubsub.subscribe(stream)
+
+            while self._enabled:
+                #msg = redis_pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
+                msg = cache_pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
+                if msg is None:
+                    continue
+                if 'data' in msg:
+                    sys.stdout.write(msg['data'].decode('utf-8'))
+            
+            logger.debug('Logger monitor thread for stream {} finished'.format(stream))
+
+        def start(self):
+            # self._logger_thread.daemon = True
+            self._enabled = True
+            self._logger_thread.start()
+
+        def stop(self):
+            self._enabled = False
+            self._logger_thread.join(5)
+

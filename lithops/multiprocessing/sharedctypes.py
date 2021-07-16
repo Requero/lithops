@@ -34,7 +34,7 @@ class SharedCTypeProxy:
     def __init__(self, ctype, *args, **kwargs):
         self._typeid = ctype.__name__
         self._oid = '{}-{}'.format(self._typeid, util.get_uuid())
-        self._client = util.get_redis_client()
+        self._client = util.get_cache_client()
         self._ref = util.RemoteReference(self._oid, client=self._client)
         logger.debug('Requested creation on shared C type %s', self._oid)
 
@@ -63,135 +63,254 @@ class SynchronizedSharedCTypeProxy(SharedCTypeProxy):
         return self._lock
 
 
-class RawValueProxy(SharedCTypeProxy):
-    def __init__(self, ctype, *args, **kwargs):
-        super().__init__(ctype=ctype)
+if 'redis' in util.load_config()['lithops']['cache'] :
 
-    def __setattr__(self, key, value):
-        if key == 'value':
-            obj = cloudpickle.dumps(value)
-            logger.debug('Set raw value %s of size %i B', self._oid, len(obj))
-            self._client.set(self._oid, obj, ex=mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
-        else:
-            super().__setattr__(key, value)
+    class RawValueProxy(SharedCTypeProxy):
+        def __init__(self, ctype, *args, **kwargs):
+            super().__init__(ctype=ctype)
 
-    def __getattr__(self, item):
-        if item == 'value':
-            obj = self._client.get(self._oid)
-            if not obj:
-                logger.debug('Get value %s returned None', self._oid)
-                value = 0
+        def __setattr__(self, key, value):
+            if key == 'value':
+                obj = cloudpickle.dumps(value)
+                logger.debug('Set raw value %s of size %i B', self._oid, len(obj))
+                self._client.set(self._oid, obj, ex=mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
             else:
-                logger.debug('Get value %s of size %i B', self._oid, len(obj))
-                value = cloudpickle.loads(obj)
-            return value
-        else:
-            super().__getattribute__(item)
+                super().__setattr__(key, value)
+
+        def __getattr__(self, item):
+            if item == 'value':
+                obj = self._client.get(self._oid)
+                if not obj:
+                    logger.debug('Get value %s returned None', self._oid)
+                    value = 0
+                else:
+                    logger.debug('Get value %s of size %i B', self._oid, len(obj))
+                    value = cloudpickle.loads(obj)
+                return value
+            else:
+                super().__getattribute__(item)
 
 
-class SynchronizedValueProxy(RawValueProxy, SynchronizedSharedCTypeProxy):
-    def __init__(self, ctype, lock=None, ctx=None, *args, **kwargs):
-        super().__init__(ctype=ctype, lock=lock, ctx=ctx)
+    class SynchronizedValueProxy(RawValueProxy, SynchronizedSharedCTypeProxy):
+        def __init__(self, ctype, lock=None, ctx=None, *args, **kwargs):
+            super().__init__(ctype=ctype, lock=lock, ctx=ctx)
 
-    def get_obj(self):
-        return self.value
+        def get_obj(self):
+            return self.value
 
 
-class RawArrayProxy(SharedCTypeProxy):
-    def __init__(self, ctype, *args, **kwargs):
-        super().__init__(ctype)
-        self._it = 0
+    class RawArrayProxy(SharedCTypeProxy):
+        def __init__(self, ctype, *args, **kwargs):
+            super().__init__(ctype)
+            self._it = 0
 
-    def _append(self, value):
-        obj = cloudpickle.dumps(value)
-        self._client.rpush(self._oid, obj)
-
-    def _extend(self, arr):
-        objs = [cloudpickle.dumps(obj) for obj in arr]
-        self._client.rpush(self._oid, *objs)
-
-    def __len__(self):
-        return self._client.llen(self._oid)
-
-    def __iter__(self):
-        self._it = 0
-        return self
-
-    def __next__(self):
-        if self._it >= self.__len__():
-            raise StopIteration()
-        elem = self.__getitem__(self._it)
-        self._it += 1
-        return elem
-
-    def __getitem__(self, i):
-        if isinstance(i, slice):
-            start, stop, step = i.indices(self.__len__())
-            stop -= 1
-            logger.debug('Requested get list slice from %i to %i', start, stop)
-            objl = self._client.lrange(self._oid, start, stop)
-            self._client.expire(self._oid, mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
-            return [cloudpickle.loads(obj) for obj in objl]
-        else:
-            obj = self._client.lindex(self._oid, i)
-            logger.debug('Requested get list index %i of size %i B', i, len(obj))
-            return cloudpickle.loads(obj)
-
-    def __setitem__(self, i, value):
-        if isinstance(i, slice):
-            start, stop, step = i.indices(self.__len__())
-            logger.debug('Requested set slice from %i to %i', start, stop)
-            pipeline = self._client.pipeline()
-            for i, val in enumerate(value):
-                obj = cloudpickle.dumps(val)
-                pipeline.lset(self._oid, i + start, obj)
-            pipeline.execute()
-        else:
+        def _append(self, value):
             obj = cloudpickle.dumps(value)
-            logger.debug('Requested set list index %i of size %i B', i, len(obj))
-            self._client.lset(self._oid, i, obj)
-            self._client.expire(self._oid, mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
+            self._client.rpush(self._oid, obj)
 
+        def _extend(self, arr):
+            objs = [cloudpickle.dumps(obj) for obj in arr]
+            self._client.rpush(self._oid, *objs)
 
-class SynchronizedArrayProxy(RawArrayProxy, SynchronizedSharedCTypeProxy):
-    def __init__(self, ctype, lock=None, ctx=None, *args, **kwargs):
-        super().__init__(ctype=ctype, lock=lock, ctx=ctx)
+        def __len__(self):
+            return self._client.llen(self._oid)
 
-    def get_obj(self):
-        return self[:]
+        def __iter__(self):
+            self._it = 0
+            return self
 
+        def __next__(self):
+            if self._it >= self.__len__():
+                raise StopIteration()
+            elem = self.__getitem__(self._it)
+            self._it += 1
+            return elem
 
-class SynchronizedStringProxy(SynchronizedArrayProxy):
-    def __init__(self, ctype, lock=None, ctx=None, *args, **kwargs):
-        super().__init__(ctype, lock=lock, ctx=ctx)
+        def __getitem__(self, i):
+            if isinstance(i, slice):
+                start, stop, step = i.indices(self.__len__())
+                stop -= 1
+                logger.debug('Requested get list slice from %i to %i', start, stop)
+                objl = self._client.lrange(self._oid, start, stop)
+                self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+                return [cloudpickle.loads(obj) for obj in objl]
+            else:
+                obj = self._client.lindex(self._oid, i)
+                logger.debug('Requested get list index %i of size %i B', i, len(obj))
+                return cloudpickle.loads(obj)
 
-    def __setattr__(self, key, value):
-        if key == 'value':
-            for i, elem in enumerate(value):
-                obj = cloudpickle.dumps(elem)
-                logger.debug('Requested set string index %i of size %i B', i, len(obj))
+        def __setitem__(self, i, value):
+            if isinstance(i, slice):
+                start, stop, step = i.indices(self.__len__())
+                logger.debug('Requested set slice from %i to %i', start, stop)
+                pipeline = self._client.pipeline()
+                for i, val in enumerate(value):
+                    obj = cloudpickle.dumps(val)
+                    pipeline.lset(self._oid, i + start, obj)
+                pipeline.execute()
+            else:
+                obj = cloudpickle.dumps(value)
+                logger.debug('Requested set list index %i of size %i B', i, len(obj))
                 self._client.lset(self._oid, i, obj)
-                self._client.expire(self._oid, mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
-        else:
-            super().__setattr__(key, value)
+                self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
 
-    def __getattr__(self, item):
-        if item == 'value':
+
+    class SynchronizedArrayProxy(RawArrayProxy, SynchronizedSharedCTypeProxy):
+        def __init__(self, ctype, lock=None, ctx=None, *args, **kwargs):
+            super().__init__(ctype=ctype, lock=lock, ctx=ctx)
+
+        def get_obj(self):
             return self[:]
-        else:
-            super().__getattribute__(item)
 
-    def __getitem__(self, i):
-        if isinstance(i, slice):
-            start, stop, step = i.indices(self.__len__())
-            logger.debug('Requested get string slice from %i to %i', start, stop)
-            objl = self._client.lrange(self._oid, start, stop)
-            self._client.expire(self._oid, mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
-            return bytes([cloudpickle.loads(obj) for obj in objl])
-        else:
-            obj = self._client.lindex(self._oid, i)
-            self._client.expire(self._oid, mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
-            return bytes([cloudpickle.loads(obj)])
+
+    class SynchronizedStringProxy(SynchronizedArrayProxy):
+        def __init__(self, ctype, lock=None, ctx=None, *args, **kwargs):
+            super().__init__(ctype, lock=lock, ctx=ctx)
+
+        def __setattr__(self, key, value):
+            if key == 'value':
+                for i, elem in enumerate(value):
+                    obj = cloudpickle.dumps(elem)
+                    logger.debug('Requested set string index %i of size %i B', i, len(obj))
+                    self._client.lset(self._oid, i, obj)
+                    self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+            else:
+                super().__setattr__(key, value)
+
+        def __getattr__(self, item):
+            if item == 'value':
+                return self[:]
+            else:
+                super().__getattribute__(item)
+
+        def __getitem__(self, i):
+            if isinstance(i, slice):
+                start, stop, step = i.indices(self.__len__())
+                logger.debug('Requested get string slice from %i to %i', start, stop)
+                objl = self._client.lrange(self._oid, start, stop)
+                self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+                return bytes([cloudpickle.loads(obj) for obj in objl])
+            else:
+                obj = self._client.lindex(self._oid, i)
+                self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+                return bytes([cloudpickle.loads(obj)])
+
+
+elif 'memcached' in util.load_config()['lithops']['cache'] :
+
+    class RawValueProxy(SharedCTypeProxy):
+        def __init__(self, ctype, *args, **kwargs):
+            super().__init__(ctype=ctype)
+
+        def __setattr__(self, key, value):
+            if key == 'value':
+                obj = cloudpickle.dumps(value)
+                logger.debug('Set raw value %s of size %i B', self._oid, len(obj))
+                self._client.set(self._oid, obj)
+            else:
+                super().__setattr__(key, value)
+
+        def __getattr__(self, item):
+            if item == 'value':
+                obj = self._client.get(self._oid)
+                if not obj:
+                    logger.debug('Get value %s returned None', self._oid)
+                    value = 0
+                else:
+                    logger.debug('Get value %s of size %i B', self._oid, len(obj))
+                    value = cloudpickle.loads(obj)
+                return value
+            else:
+                super().__getattribute__(item)
+    
+
+    class RawArrayProxy(SharedCTypeProxy):
+        def __init__(self, ctype, *args, **kwargs):
+            super().__init__(ctype)
+
+        def _append(self, value):
+            obj = cloudpickle.dumps(value)
+            self._client.rpush(self._oid, obj)
+
+        def __len__(self):
+            return len(self._pickler.loads(self._client.get(self._oid)))
+
+        def __getitem__(self, i):
+            if isinstance(i, slice):
+                start, stop, step = i.indices(self.__len__())
+                logger.debug('Requested get list slice from %i to %i', start, stop)
+                objl = self._client.lrange(self._oid, start, stop)
+                #self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+                self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+                return [cloudpickle.loads(obj) for obj in objl]
+            else:
+                obj = self._client.lindex(self._oid, i)
+                logger.debug('Requested get list index %i of size %i B', i, len(obj))
+                return cloudpickle.loads(obj)
+
+        def __setitem__(self, i, value):
+            if isinstance(i, slice):
+                start, stop, step = i.indices(self.__len__())
+                for i, val in enumerate(value):
+                    self[i + start] = val
+            else:
+                obj = cloudpickle.dumps(value)
+                logger.debug('Requested set list index %i of size %i B', i, len(obj))
+                self._client.lset(self._oid, i, obj)
+                #self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+                self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+
+
+    class SynchronizedValueProxy(RawValueProxy, SynchronizedSharedCTypeProxy):
+        def __init__(self, ctype, lock=None, ctx=None, *args, **kwargs):
+            super().__init__(ctype=ctype, lock=lock, ctx=ctx)
+
+        def get_obj(self):
+            return self.value
+
+
+    class SynchronizedArrayProxy(RawArrayProxy, SynchronizedSharedCTypeProxy):
+        def __init__(self, ctype, lock=None, ctx=None, *args, **kwargs):
+            super().__init__(ctype=ctype, lock=lock, ctx=ctx)
+
+        def get_obj(self):
+            return self[:]
+
+
+    class SynchronizedStringProxy(SynchronizedArrayProxy):
+        def __init__(self, ctype, lock=None, ctx=None, *args, **kwargs):
+            super().__init__(ctype, lock=lock, ctx=ctx)
+
+        def __setattr__(self, key, value):
+            if key == 'value':
+                current = self._pickler.loads(self._client.get(self._oid))
+                for i, elem in enumerate(value):
+                    obj = cloudpickle.dumps(elem)
+                    logger.debug('Requested set string index %i of size %i B', i, len(obj))
+                    current.insert(index, elem)
+                self._client.set(self._oid, self._pickler.dumps(current))
+            else:
+                super().__setattr__(key, value)
+
+        def __getattr__(self, item):
+            if item == 'value':
+                return self[:]
+            else:
+                super().__getattribute__(item)
+
+        def __getitem__(self, i):
+            if isinstance(i, slice):
+                start, stop, step = i.indices(self.__len__())
+                logger.debug('Requested get string slice from %i to %i', start, stop)
+                objl = self._client.lrange(self._oid, start, stop)
+                #self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+                self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+                return bytes([cloudpickle.loads(obj) for obj in objl])
+            else:
+                obj = self._client.lindex(self._oid, i)
+                #self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+                self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+                return bytes([cloudpickle.loads(obj)])
 
 
 #
