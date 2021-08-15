@@ -15,9 +15,6 @@
 import queue
 import itertools
 import logging
-import json
-import os
-import traceback
 
 from lithops import FunctionExecutor
 
@@ -240,12 +237,11 @@ class ApplyResult(object):
         self._executor.wait(self._futures, download_results=False, timeout=timeout, throw_except=False)
 
     def get(self, timeout=None):
-        self._value = self._executor.get_result(self._futures, timeout=timeout)
+        self.wait(timeout)
+        self._value = self._executor.get_result(self._futures)
 
         if self._callback is not None:
             self._callback(self._value)
-
-        util.export_execution_details(self._futures, self._executor)
 
         return self._value
 

@@ -5,6 +5,8 @@
 # Modifications Copyright (c) 2020 Cloudlab URV
 #
 
+from . import config
+
 from .context import (CloudContext, cpu_count, get_context,
                       get_all_start_methods, set_start_method, get_start_method)
 from .context import CloudContext as DefaultContext
@@ -20,6 +22,6 @@ from .synchronize import (Semaphore, BoundedSemaphore,
 from .process import current_process, active_children, parent_process
 
 
-from . import config
+
 
 context = CloudContext()

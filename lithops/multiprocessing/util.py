@@ -8,24 +8,68 @@
 #
 # Modifications Copyright (c) 2020 Cloudlab URV
 #
-import traceback
+
 import weakref
 import redis
 import pymemcache
 import cloudpickle
 import uuid
 import logging
+import lithops
 import sys
 import threading
 import io
-import os
-import json
-import socket
+import itertools
 from lithops.config import load_config
-
 from . import config as mp_config
+#
+# Logging
+#
 
-logger = logging.getLogger(__name__)
+NOTSET = 0
+SUBDEBUG = 5
+DEBUG = 10
+INFO = 20
+SUBWARNING = 25
+
+_logger = logging.getLogger(lithops.__name__)
+_log_to_stderr = False
+
+
+def sub_debug(msg, *args):
+    if _logger:
+        _logger.log(SUBDEBUG, msg, *args)
+
+
+def debug(msg, *args):
+    if _logger:
+        _logger.log(DEBUG, msg, *args)
+
+
+def info(msg, *args):
+    if _logger:
+        _logger.log(INFO, msg, *args)
+
+
+def sub_warning(msg, *args):
+    if _logger:
+        _logger.log(SUBWARNING, msg, *args)
+
+
+def get_logger():
+    return _logger
+
+
+def log_to_stderr():
+    raise NotImplementedError()
+
+
+#
+# Process function wrapper
+#
+
+def func_wrapper(func):
+    pass
 
 
 #
@@ -37,7 +81,6 @@ class PicklableRedis(redis.StrictRedis):
         self._args = args
         self._kwargs = kwargs
         self._type = 'redis'
-        logger.debug('Creating picklable Redis client')
         super().__init__(*self._args, **self._kwargs)
 
     def __getstate__(self):
@@ -45,20 +88,15 @@ class PicklableRedis(redis.StrictRedis):
 
     def __setstate__(self, state):
         self.__init__(*state[0], **state[1])
-    
+
     def get_type(self):
         return self._type
-
-#
-# Picklable memcached client
-#
 
 class PicklableMemcached(pymemcache.Client):
     def __init__(self, *args, **kwargs):
         self._args = args
         self._kwargs = kwargs
-        self._type = 'redis'
-        logger.debug('Creating picklable Memcached client')
+        self._type = 'memcached'
         super().__init__(*self._args, **self._kwargs)
 
     def __getstate__(self):
@@ -66,66 +104,48 @@ class PicklableMemcached(pymemcache.Client):
 
     def __setstate__(self, state):
         self.__init__(*state[0], **state[1])
-    
+
     def get_type(self):
         return self._type
-
+        
+#def get_redis_client(**overwrites):
 def get_cache_client(**overwrites):
     try:
-        if 'redis' in load_config()['lithops']['cache'] :
+        mp_config.get_parameter(mp_config.PIPE_CONNECTION_TYPE)
+        #if 'redis' in  mp_config.get_parameter(mp_config.CACHE) :
+        if 'redis' in mp_config.get_parameter(mp_config.CACHE) :
             conn_params = load_config()['redis']
-        if 'memcached' in load_config()['lithops']['cache'] :
+        elif 'memcached' in mp_config.get_parameter(mp_config.CACHE):
             conn_params = load_config()['memcached']
+
+        
     except KeyError:
         raise Exception('Redis section not found in you config')
     conn_params.update(overwrites)
-    if 'redis' in load_config()['lithops']['cache'] :
+    if 'redis' in mp_config.get_parameter(mp_config.CACHE) :
         return PicklableRedis(**conn_params)
-    if 'memcached' in load_config()['lithops']['cache'] :
+    if 'memcached' in mp_config.get_parameter(mp_config.CACHE) :
         return PicklableMemcached((conn_params['host'],conn_params['port']))
 
-
 #
-# Helper functions
+# Unique id for redis keys/hashes
 #
 
 def get_uuid(length=12):
     return uuid.uuid1().hex[:length]
 
 
+#
+# Make stateless redis Lua script (redis.client.Script)
+# Just to ensure no redis client is cache'd and avoid 
+# creating another connection when unpickling this object.
+#
+
 def make_stateless_script(script):
-    # Make stateless redis Lua script (redis.client.Script)
-    # Just to ensure no redis client is cache'd and avoid
-    # creating another connection when unpickling this object.
     script.registered_client = None
     return script
 
-
-def export_execution_details(futures, lithops_executor):
-    if mp_config.get_parameter(mp_config.EXPORT_EXECUTION_DETAILS):
-        try:
-            path = os.path.realpath(mp_config.get_parameter(mp_config.EXPORT_EXECUTION_DETAILS))
-            job_id = futures[0].job_id
-            plots_file_name = '{}_{}'.format(lithops_executor.executor_id, job_id)
-            lithops_executor.plot(fs=futures, dst=os.path.join(path, plots_file_name))
-
-            stats = {fut.call_id: fut.stats for fut in futures}
-            stats_file_name = '{}_{}_stats.json'.format(lithops_executor.executor_id, job_id)
-            with open(os.path.join(path, stats_file_name), 'w') as stats_file:
-                stats_json = json.dumps(stats, indent=4)
-                stats_file.write(stats_json)
-        except Exception as e:
-            logger.error('Error while exporting execution results: {}\n{}'.format(e, traceback.format_exc()))
-
-
-def get_network_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    s.connect(('<broadcast>', 0))
-    return s.getsockname()[0]
-
-if 'redis' in load_config()['lithops']['cache']:
-
+if 'redis' in  mp_config.get_parameter(mp_config.CACHE):
     #
     # object for counting remote references (redis keys)
     # and garbage collect them automatically when nothing
@@ -144,6 +164,7 @@ if 'redis' in load_config()['lithops']['cache']:
             # reference counter key
             self._rck = '{}-{}'.format('ref', self._referenced[0])
             self._referenced.append(self._rck)
+            #self._client = client or get_redis_client()
             self._client = client or get_cache_client()
 
             self._callback = None
@@ -180,19 +201,11 @@ if 'redis' in load_config()['lithops']['cache']:
 
         def incref(self):
             if not self.managed:
-                pipeline = self._client.pipeline()
-                pipeline.incr(self._rck, 1)
-                pipeline.expire(self._rck, mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
-                counter, _ = pipeline.execute()
-                return int(counter)
+                return int(self._client.incr(self._rck, 1))
 
         def decref(self):
             if not self.managed:
-                pipeline = self._client.pipeline()
-                pipeline.decr(self._rck, 1)
-                pipeline.expire(self._rck, mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
-                counter, _ = pipeline.execute()
-                return int(counter)
+                return int(self._client.decr(self._rck, 1))
 
         def refcount(self):
             count = self._client.get(self._rck)
@@ -208,6 +221,7 @@ if 'redis' in load_config()['lithops']['cache']:
             count = int(client.decr(rck, 1))
             if count < 0 and len(referenced) > 0:
                 client.delete(*referenced)
+            pass
 
 
     #
@@ -218,7 +232,8 @@ if 'redis' in load_config()['lithops']['cache']:
         def __init__(self, stream):
             self._feeder_thread = threading
             self._buff = io.StringIO()
-            self._redis = get_cache_client()
+            #self._redis = get_redis_client()
+            self._client = get_cache_client()
             self._stream = stream
             self._offset = 0
 
@@ -230,8 +245,8 @@ if 'redis' in load_config()['lithops']['cache']:
         def flush(self):
             self._buff.seek(self._offset)
             log = self._buff.read()
-            logger.debug('Flush remote logging stream (len %i)', len(log))
-            self._redis.publish(self._stream, log)
+            #self._redis.publish(self._stream, log)
+            self._client.publish(self._stream, log)
             self._offset = self._buff.tell()
             # self._buff = io.StringIO()
             # FIXME flush() does not empty the buffer?
@@ -241,12 +256,10 @@ if 'redis' in load_config()['lithops']['cache']:
             import sys
             self._old_stdout = sys.stdout
             sys.stdout = self
-            logger.debug('Starting remote logging feed to stream %s', self._stream)
 
         def stop(self):
             import sys
             sys.stdout = self._old_stdout
-            logger.debug('Stopping remote logging feed to stream %s', self._stream)
 
 
     class RemoteLoggingFeed:
@@ -256,18 +269,21 @@ if 'redis' in load_config()['lithops']['cache']:
             self._enabled = False
 
         def _logger_monitor(self, stream):
-            logger.debug('Starting logger feeder thread for stream %s', stream)
-            redis_pubsub = get_cache_client().pubsub()
-            redis_pubsub.subscribe(stream)
+            debug('Starting logger monitor thread for stream {}'.format(stream))
+            #redis_pubsub = get_redis_client().pubsub()
+            #redis_pubsub.subscribe(stream)
+            cache_pubsub = get_cache_client().pubsub()
+            cache_pubsub.subscribe(stream)
 
             while self._enabled:
-                msg = redis_pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
+                #msg = redis_pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
+                msg = cache_pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
                 if msg is None:
                     continue
                 if 'data' in msg:
                     sys.stdout.write(msg['data'].decode('utf-8'))
 
-            logger.debug('Logger monitor thread for stream %s finished', stream)
+            debug('Logger monitor thread for stream {} finished'.format(stream))
 
         def start(self):
             # self._logger_thread.daemon = True
@@ -278,8 +294,7 @@ if 'redis' in load_config()['lithops']['cache']:
             self._enabled = False
             self._logger_thread.join(5)
 
-
-elif 'memcached' in load_config()['lithops']['cache']:
+elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE):
 
     #
     # object for counting remote references (redis keys)
@@ -422,7 +437,7 @@ elif 'memcached' in load_config()['lithops']['cache']:
             self._enabled = False
 
         def _logger_monitor(self, stream):
-            logger.debug('Starting logger monitor thread for stream {}'.format(stream))
+            debug('Starting logger monitor thread for stream {}'.format(stream))
             #redis_pubsub = get_redis_client().pubsub()
             #redis_pubsub.subscribe(stream)
             cache_pubsub = get_cache_client().pubsub()
@@ -435,8 +450,8 @@ elif 'memcached' in load_config()['lithops']['cache']:
                     continue
                 if 'data' in msg:
                     sys.stdout.write(msg['data'].decode('utf-8'))
-            
-            logger.debug('Logger monitor thread for stream {} finished'.format(stream))
+
+            debug('Logger monitor thread for stream {} finished'.format(stream))
 
         def start(self):
             # self._logger_thread.daemon = True
@@ -447,3 +462,26 @@ elif 'memcached' in load_config()['lithops']['cache']:
             self._enabled = False
             self._logger_thread.join(5)
 
+
+    
+_afterfork_registry = weakref.WeakValueDictionary()
+_afterfork_counter = itertools.count()
+
+def _run_after_forkers():
+    items = list(_afterfork_registry.items())
+    items.sort()
+    for (index, ident, func), obj in items:
+        try:
+            func(obj)
+        except Exception as e:
+            info('after forker raised exception %s', e)
+
+def register_after_fork(obj, func):
+    _afterfork_registry[(next(_afterfork_counter), id(obj), func)] = obj
+
+#
+# Finalization using weakrefs
+#
+
+_finalizer_registry = {}
+_finalizer_counter = itertools.count()
