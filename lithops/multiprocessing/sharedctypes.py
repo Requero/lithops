@@ -30,40 +30,17 @@ typecode_to_type = {
 }
 
 
-class SharedCTypeProxy:
-    def __init__(self, ctype, *args, **kwargs):
-        self._typeid = ctype.__name__
-        self._oid = '{}-{}'.format(self._typeid, util.get_uuid())
-        self._client = util.get_cache_client()
-        self._ref = util.RemoteReference(self._oid, client=self._client)
-        logger.debug('Requested creation on shared C type %s', self._oid)
+if 'redis' in util. mp_config.get_parameter(mp_config.CACHE) :
 
+    class SharedCTypeProxy:
+        def __init__(self, ctype, *args, **kwargs):
+            self._typeid = ctype.__name__
+            self._oid = '{}-{}'.format(self._typeid, util.get_uuid())
+            #self._client = util.get_redis_client()
+            self._client = util.get_cache_client()
+            self._ref = util.RemoteReference(self._oid, client=self._client)
+            logger.debug('Requested creation on shared C type %s', self._oid)
 
-class SynchronizedSharedCTypeProxy(SharedCTypeProxy):
-    def __init__(self, ctype, lock=None, ctx=None, *args, **kwargs):
-        super().__init__(ctype=ctype)
-        if lock:
-            self._lock = lock
-        else:
-            ctx = ctx or get_context()
-            self._lock = ctx.RLock()
-        self.acquire = self._lock.acquire
-        self.release = self._lock.release
-
-    def __enter__(self):
-        return self._lock.__enter__()
-
-    def __exit__(self, *args):
-        return self._lock.__exit__(*args)
-
-    def get_obj(self):
-        raise NotImplementedError()
-
-    def get_lock(self):
-        return self._lock
-
-
-if 'redis' in util.load_config()['lithops']['cache'] :
 
     class RawValueProxy(SharedCTypeProxy):
         def __init__(self, ctype, *args, **kwargs):
@@ -91,45 +68,20 @@ if 'redis' in util.load_config()['lithops']['cache'] :
                 super().__getattribute__(item)
 
 
-    class SynchronizedValueProxy(RawValueProxy, SynchronizedSharedCTypeProxy):
-        def __init__(self, ctype, lock=None, ctx=None, *args, **kwargs):
-            super().__init__(ctype=ctype, lock=lock, ctx=ctx)
-
-        def get_obj(self):
-            return self.value
-
-
     class RawArrayProxy(SharedCTypeProxy):
         def __init__(self, ctype, *args, **kwargs):
             super().__init__(ctype)
-            self._it = 0
 
         def _append(self, value):
             obj = cloudpickle.dumps(value)
             self._client.rpush(self._oid, obj)
 
-        def _extend(self, arr):
-            objs = [cloudpickle.dumps(obj) for obj in arr]
-            self._client.rpush(self._oid, *objs)
-
         def __len__(self):
             return self._client.llen(self._oid)
-
-        def __iter__(self):
-            self._it = 0
-            return self
-
-        def __next__(self):
-            if self._it >= self.__len__():
-                raise StopIteration()
-            elem = self.__getitem__(self._it)
-            self._it += 1
-            return elem
 
         def __getitem__(self, i):
             if isinstance(i, slice):
                 start, stop, step = i.indices(self.__len__())
-                stop -= 1
                 logger.debug('Requested get list slice from %i to %i', start, stop)
                 objl = self._client.lrange(self._oid, start, stop)
                 self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
@@ -142,17 +94,45 @@ if 'redis' in util.load_config()['lithops']['cache'] :
         def __setitem__(self, i, value):
             if isinstance(i, slice):
                 start, stop, step = i.indices(self.__len__())
-                logger.debug('Requested set slice from %i to %i', start, stop)
-                pipeline = self._client.pipeline()
                 for i, val in enumerate(value):
-                    obj = cloudpickle.dumps(val)
-                    pipeline.lset(self._oid, i + start, obj)
-                pipeline.execute()
+                    self[i + start] = val
             else:
                 obj = cloudpickle.dumps(value)
                 logger.debug('Requested set list index %i of size %i B', i, len(obj))
                 self._client.lset(self._oid, i, obj)
                 self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+
+
+    class SynchronizedSharedCTypeProxy(SharedCTypeProxy):
+        def __init__(self, ctype, lock=None, ctx=None, *args, **kwargs):
+            super().__init__(ctype=ctype)
+            if lock:
+                self._lock = lock
+            else:
+                ctx = ctx or get_context()
+                self._lock = ctx.RLock()
+            self.acquire = self._lock.acquire
+            self.release = self._lock.release
+
+        def __enter__(self):
+            return self._lock.__enter__()
+
+        def __exit__(self, *args):
+            return self._lock.__exit__(*args)
+
+        def get_obj(self):
+            raise NotImplementedError()
+
+        def get_lock(self):
+            return self._lock
+
+
+    class SynchronizedValueProxy(RawValueProxy, SynchronizedSharedCTypeProxy):
+        def __init__(self, ctype, lock=None, ctx=None, *args, **kwargs):
+            super().__init__(ctype=ctype, lock=lock, ctx=ctx)
+
+        def get_obj(self):
+            return self.value
 
 
     class SynchronizedArrayProxy(RawArrayProxy, SynchronizedSharedCTypeProxy):
@@ -195,8 +175,17 @@ if 'redis' in util.load_config()['lithops']['cache'] :
                 self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
                 return bytes([cloudpickle.loads(obj)])
 
+elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE) :
 
-elif 'memcached' in util.load_config()['lithops']['cache'] :
+    class SharedCTypeProxy:
+        def __init__(self, ctype, *args, **kwargs):
+            self._typeid = ctype.__name__
+            self._oid = '{}-{}'.format(self._typeid, util.get_uuid())
+            #self._client = util.get_redis_client()
+            self._client = util.get_cache_client()
+            self._ref = util.RemoteReference(self._oid, client=self._client)
+            logger.debug('Requested creation on shared C type %s', self._oid)
+
 
     class RawValueProxy(SharedCTypeProxy):
         def __init__(self, ctype, *args, **kwargs):
@@ -227,24 +216,24 @@ elif 'memcached' in util.load_config()['lithops']['cache'] :
     class RawArrayProxy(SharedCTypeProxy):
         def __init__(self, ctype, *args, **kwargs):
             super().__init__(ctype)
+            self._client.set(self._oid+'count',0)
 
         def _append(self, value):
-            obj = cloudpickle.dumps(value)
-            self._client.rpush(self._oid, obj)
+            count = int(self._client.incr(self._oid+'count',1))
+            self._client.set(str(self._oid)+str(count-1), cloudpickle.dumps(value))
 
         def __len__(self):
-            return len(self._pickler.loads(self._client.get(self._oid)))
+            return int(self._client.get(self._oid+'count'))
 
         def __getitem__(self, i):
             if isinstance(i, slice):
                 start, stop, step = i.indices(self.__len__())
+                keys = [str(self._oid)+str(j) for j in range(start, stop, step)]
                 logger.debug('Requested get list slice from %i to %i', start, stop)
-                objl = self._client.lrange(self._oid, start, stop)
-                #self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
-                self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
-                return [cloudpickle.loads(obj) for obj in objl]
+                objs = self._client.get_many(keys)
+                return [cloudpickle.loads(obj) for obj in objs.values()]
             else:
-                obj = self._client.lindex(self._oid, i)
+                obj = self._client.get(str(self._oid)+str(i))
                 logger.debug('Requested get list index %i of size %i B', i, len(obj))
                 return cloudpickle.loads(obj)
 
@@ -256,9 +245,31 @@ elif 'memcached' in util.load_config()['lithops']['cache'] :
             else:
                 obj = cloudpickle.dumps(value)
                 logger.debug('Requested set list index %i of size %i B', i, len(obj))
-                self._client.lset(self._oid, i, obj)
-                #self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
-                self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+                self._client.set(str(self._oid)+str(i), obj)
+
+
+    class SynchronizedSharedCTypeProxy(SharedCTypeProxy):
+        def __init__(self, ctype, lock=None, ctx=None, *args, **kwargs):
+            super().__init__(ctype=ctype)
+            if lock:
+                self._lock = lock
+            else:
+                ctx = ctx or get_context()
+                self._lock = ctx.RLock()
+            self.acquire = self._lock.acquire
+            self.release = self._lock.release
+
+        def __enter__(self):
+            return self._lock.__enter__()
+
+        def __exit__(self, *args):
+            return self._lock.__exit__(*args)
+
+        def get_obj(self):
+            raise NotImplementedError()
+
+        def get_lock(self):
+            return self._lock
 
 
     class SynchronizedValueProxy(RawValueProxy, SynchronizedSharedCTypeProxy):
@@ -283,12 +294,12 @@ elif 'memcached' in util.load_config()['lithops']['cache'] :
 
         def __setattr__(self, key, value):
             if key == 'value':
-                current = self._pickler.loads(self._client.get(self._oid))
+                #current = self._pickler.loads(self._client.get(self._oid))
                 for i, elem in enumerate(value):
-                    obj = cloudpickle.dumps(elem)
+                    #obj = cloudpickle.dumps(elem)
                     logger.debug('Requested set string index %i of size %i B', i, len(obj))
-                    current.insert(index, elem)
-                self._client.set(self._oid, self._pickler.dumps(current))
+                    #current.insert(i, elem)
+                    self._client.set(self._oid+str(i), cloudpickle.dumps(elem))
             else:
                 super().__setattr__(key, value)
 
@@ -301,16 +312,23 @@ elif 'memcached' in util.load_config()['lithops']['cache'] :
         def __getitem__(self, i):
             if isinstance(i, slice):
                 start, stop, step = i.indices(self.__len__())
+                keys = [str(self._oid)+str(j) for j in range(start, stop, step)]
                 logger.debug('Requested get string slice from %i to %i', start, stop)
-                objl = self._client.lrange(self._oid, start, stop)
+                objl = self._client.get_many(keys)
+                #objl = self._client.lrange(self._oid, start, stop)
+                #self._client.expire(self._oid, mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
                 #self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
-                self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
-                return bytes([cloudpickle.loads(obj) for obj in objl])
+                #objl = self._client.get_many(keys)
+                #print(self._client.get(self._oid))
+                #print(cloudpickle.loads(self._client.get(self._oid)))
+                #return cloudpickle.loads(self._client.get(self._oid))[start:stop]
+                return bytes([cloudpickle.loads(obj) for obj in objl.values()])
             else:
-                obj = self._client.lindex(self._oid, i)
+                #obj = self._client.lindex(self._oid, i)
+                #self._client.expire(self._oid, mp_config.get_parameter(mp_config.REDIS_EXPIRY_TIME))
                 #self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
-                self._client.expire(self._oid, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
-                return bytes([cloudpickle.loads(obj)])
+                return bytes([cloudpickle.loads(self._client.get(self._oid+str(i)))])
+                #return cloudpickle.loads(self._client.get(self._oid+str(i)))
 
 
 #
@@ -377,7 +395,8 @@ def Array(typecode_or_type, size_or_initializer, *, lock=True, ctx=None):
         obj = SynchronizedArrayProxy(type_)
 
     if isinstance(size_or_initializer, list) or isinstance(size_or_initializer, bytes):
-        obj._extend(size_or_initializer)
+        for elem in size_or_initializer:
+            obj._append(elem)
     elif isinstance(size_or_initializer, int):
         for _ in range(size_or_initializer):
             obj._append(0)

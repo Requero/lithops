@@ -14,40 +14,41 @@
 # limitations under the License.
 #
 
-from lithops.config import load_config
-
 # General lithops.multiprocessing parameters
 LITHOPS_CONFIG = 'LITHOPS_CONFIG'  # Override lithops configuration
 STREAM_STDOUT = 'STREAM_STDOUT'  # Enable remote logging
 ENV_VARS = 'ENV_VARS'  # Processes environment variables
-EXPORT_EXECUTION_DETAILS = 'EXPORT_EXECUTION_DETAILS'  # Path to save execution details, False to disable
 
+CACHE = 'CACHE'
 # Middleware configuration parameters
 PIPE_CONNECTION_TYPE = 'PIPE_CONNECTION_TYPE'  # Pipe/Queue connection type
 
 # Redis specific parameters
-CACHE_EXPIRY_TIME = 'CACHE_EXPIRY_TIME'  # Redis key expiry time in seconds
+#REDIS_EXPIRY_TIME = 'REDIS_EXPIRY_TIME'  # Redis key expiry time in seconds
+CACHE_EXPIRY_TIME = 'CACHE_EXPIRY_TIME'
+
+from lithops.config import load_config
 
 if 'redis' in load_config()['lithops']['cache'] :
-
     _DEFAULT_CONFIG = {
         LITHOPS_CONFIG: {},
         STREAM_STDOUT: False,
         CACHE_EXPIRY_TIME: 3600,  # 1 hour
         PIPE_CONNECTION_TYPE: 'redislist',
         ENV_VARS: {},
-        EXPORT_EXECUTION_DETAILS: False
+        CACHE: 'redis',
     }
-
-elif load_config()['lithops']['cache'] == 'memcached':
+elif 'memcached' in load_config()['lithops']['cache']:
     _DEFAULT_CONFIG = {
         LITHOPS_CONFIG: {},
         STREAM_STDOUT: False,
         CACHE_EXPIRY_TIME: 3600,  # 1 hour
-        PIPE_CONNECTION_TYPE: 'nanomsg',
-        ENV_VARS: {}
+        PIPE_CONNECTION_TYPE: 'nanomsgreqrep',
+        ENV_VARS: {}, 
+        CACHE: 'memcached',
     }
-    
+
+
 _config = _DEFAULT_CONFIG
 
 
