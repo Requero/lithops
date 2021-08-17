@@ -726,11 +726,6 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
     #
 
     class SemLock:
-        # KEYS[1] - semlock name
-        # ARGV[1] - max value
-        # return new semlock value
-        # only increments its value if
-        # it is not above the max value
         
 
         def __init__(self, value=1, max_value=1):
@@ -741,14 +736,11 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
 
             self._connection = pika.BlockingConnection(self._parameters)
             self._channel = self._connection.channel()
-            if self._max_value > 0:
-                args = {"x-max-length":max_value}
-            else:
-                args = {}
-            self._channel.queue_declare(queue=self._name, arguments =args)
+            self._channel.queue_declare(queue=self._name)
             if value != 0:
                 for i in range(value):
-                    self._channel.basic_publish(exchange = '', routing_key=self._name,body='')
+                    msg = 'value-'+str(time.time())
+                    self._channel.basic_publish(exchange = '', routing_key=self._name,body=msg)
             #self._ref = util.RemoteReference(self._name, client=self._client)
 
         def __getstate__(self):
@@ -776,13 +768,13 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
                 def callback(ch, method, properties, body):
                     ch.basic_ack(delivery_tag=method.delivery_tag)
                     ch.stop_consuming()
-                #self._channel.basic_qos(prefetch_count=1)
+                self._channel.basic_qos(prefetch_count=1)
                 self._channel.basic_consume(queue=self._name, on_message_callback=callback)
                 self._channel.start_consuming()
                 return True
             else:
                 logger.debug('Requested non-blocking acquire for lock %s', self._name)
-                method, properties, body  = self._channel.basic_get(queue=self._opid, auto_ack=True)
+                method, properties, body  = self._channel.basic_get(queue=self._name, auto_ack=True)
                 return body is not None
 
         def release(self):
@@ -790,7 +782,8 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
             current_value = self.get_value()
             if current_value >= self._max_value:
                 return current_value
-            self._channel.basic_publish(exchange = '', routing_key=self._name,body='')
+            msg = 'value-'+str(time.time())
+            self._channel.basic_publish(exchange = '', routing_key=self._name,body=msg)
             return current_value + 1
 
         def __repr__(self):
@@ -992,7 +985,8 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
 
         def is_set(self):
             logger.debug('Request event %s is set', self._flag_handle)
-            method, properties, body  = self._channel.basic_get(queue=self._flag_handle, auto_ack=False)
+            method, properties, body  = self._channel.basic_get(queue=self._flag_handle, auto_ack=True)
+            channel.basic_publish(routing_key=self._flag_handle,body=body)
             return body == b'1'
 
         def set(self):
@@ -1018,46 +1012,188 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
     # Barrier
     #
 
-    class Barrier(threading.Barrier):
+    class Barrier:
         def __init__(self, parties, action=None, timeout=None):
-            self._cond = Condition()
-            self._channel = self._cond._channel
+            self._parameters = util.get_amqp_client()
+            self._connection = pika.BlockingConnection(self._parameters)
+            self._channel = self._connection.channel()
             uuid = util.get_uuid()
             self._state_handle = 'barrier-state-' + uuid
             self._count_handle = 'barrier-count-' + uuid
-            self._channel.queue_declare(queue=self._state_handle, arguments = {"x-max-length":1})
-            self._channel.queue_declare(queue=self._count_handle, arguments = {"x-max-length":1})
-            #self._ref = util.RemoteReference(referenced=[self._state_handle, self._count_handle],
-            #                                client=self._client)
+            self._channel.queue_declare(queue=self._state_handle, arguments = {"x-max-length":1}, durable = True)
+            self._channel.queue_declare(queue=self._count_handle, arguments = {"x-max-length":1}, durable = True)
+
+            self._channel.basic_publish(exchange = '', routing_key=self._state_handle,body=str(0),
+                properties=pika.BasicProperties(
+                delivery_mode=2,  # make message persistent
+                ))
+            self._channel.basic_publish(exchange = '', routing_key=self._count_handle,body=str(0),
+                properties=pika.BasicProperties(
+                delivery_mode=2,  # make message persistent
+            ))
+
+            self._cond = Condition()
             self._action = action
             self._timeout = timeout
             self._parties = parties
-            self._state = 0  # 0 = filling, 1 = draining, -1 = resetting, -2 = broken
-            self._count = 0
+            #self._state = 0  # 0 = filling, 1 = draining, -1 = resetting, -2 = broken
+            #self._count = 0
+
+            
+            #self._ref = util.RemoteReference(referenced=[self._state_handle, self._count_handle],
+            #                                client=self._client)
+            
+        def wait(self, timeout=None):
+            """Wait for the barrier.
+            When the specified number of threads have started waiting, they are all
+            simultaneously awoken. If an 'action' was provided for the barrier, one
+            of the threads will have executed that callback prior to returning.
+            Returns an individual index number from 0 to 'parties-1'.
+            """
+            if timeout is None:
+                timeout = self._timeout
+            with self._cond:
+                self._enter() # Block while the barrier drains.
+                index = self._get_count()
+                count = self._get_count()
+                self._set_count(count+1)
+                try:
+                    if index + 1 == self._parties:
+                        # We release the barrier
+                        self._release()
+                    else:
+                        # We wait until someone releases us
+                        self._wait(timeout)
+                    return index
+                finally:
+                    count = self._get_count()
+                    self._set_count(count-1)
+                    # Wake up any threads waiting for barrier to drain.
+                    self._exit()
+
+        # Block until the barrier is ready for us, or raise an exception
+        # if it is broken.
+        def _enter(self):
+            while self._get_state() in (-1, 1):
+                # It is draining or resetting, wait until done
+                self._cond.wait()
+            #see if the barrier is in a broken state
+            if self._get_state() < 0:
+                raise BrokenBarrierError
+            assert self._get_state() == 0     
+        
+        # Optionally run the 'action' and release the threads waiting
+        # in the barrier.
+        def _release(self):
+            try:
+                if self._action:
+                    self._action()
+                # enter draining state
+                self._set_state(1)
+                self._cond.notify_all()
+            except:
+                #an exception during the _action handler.  Break and reraise
+                self._break()
+                raise
+        
+        # Wait in the barrier until we are released.  Raise an exception
+        # if the barrier is reset or broken.
+        def _wait(self, timeout):
+            if not self._cond.wait_for(lambda : self._get_state() != 0, timeout):
+                #timed out.  Break the barrier
+                self._break()
+                raise BrokenBarrierError
+            if self._get_state() < 0:
+                raise BrokenBarrierError
+            assert self._get_state() == 1
+
+        # If we are the last thread to exit the barrier, signal any threads
+        # waiting for the barrier to drain.
+        def _exit(self):
+            if self._get_count() == 0:
+                if self._get_state() in (-1, 1):
+                    #resetting or draining
+                    self._set_state(0)
+                    self._cond.notify_all()
+
+        def reset(self):
+            """Reset the barrier to the initial state.
+            Any threads currently waiting will get the BrokenBarrier exception
+            raised.
+            """
+            with self._cond:
+                if self._get_count() > 0:
+                    if self._get_state() == 0:
+                        #reset the barrier, waking up threads
+                        self._set_state(-1)
+                    elif self._get_state() == -2:
+                        #was broken, set it to reset state
+                        #which clears when the last thread exits
+                        self._set_state(-1)
+                else:
+                    self._set_state(0)
+                self._cond.notify_all()
+
+        def abort(self):
+            """Place the barrier into a 'broken' state.
+            Useful in case of error.  Any currently waiting threads and threads
+            attempting to 'wait()' will have BrokenBarrierError raised.
+            """
+            with self._cond:
+                self._break()
+
+        def _break(self):
+            # An internal error was detected.  The barrier is set to
+            # a broken state all parties awakened.
+            self._set_state(-2)
+            self._cond.notify_all()
+
+        @property
+        def parties(self):
+            """Return the number of threads required to trip the barrier."""
+            return self._parties
+
+        @property
+        def n_waiting(self):
+            """Return the number of threads currently waiting at the barrier."""
+            # We don't need synchronization here since this is an ephemeral result
+            # anyway.  It returns the correct value in the steady state.
+            if self._get_state() == 0:
+                return self._get_count()
+            return 0
+
+        @property
+        def broken(self):
+            """Return True if the barrier is in a broken state."""
+            return self._get_state() == -2
 
         def __getstate__(self):
-            return (self._lock, self._parameters, self._notify_handle)
+            return (self._cond, self._parameters, self._state_handle, self._count_handle, 
+                    self._action, self._timeout, self._parties)
 
         def __setstate__(self, state):
-            (self._lock, self._parameters, self._notify_handle) = state
+            (self._cond, self._parameters, self._state_handle, self._count_handle, 
+             self._action, self._timeout, self._parties) = state
+            self._parameters = self._parameters
             self._connection = pika.BlockingConnection(self._parameters)
             self._channel = self._connection.channel()
-        @property
-        def _state(self):
-            _,_, body = self._channel.basic_get(queue=self._state_handle, auto_ack=True)
+
+        def _get_state(self):
+            method, properties, body  = self._channel.basic_get(queue=self._state_handle, auto_ack=True)
+            self._channel.basic_publish(exchange = '', routing_key=self._state_handle, body=body)
             return int(body)
 
-        @_state.setter
-        def _state(self, value):
+        def _set_state(self, value):
+            print(value)
             self._channel.basic_get(queue=self._state_handle, auto_ack=True)
             self._channel.basic_publish(exchange = '', routing_key=self._state_handle,body=str(value))
 
-        @property
-        def _count(self):
-            _,_, body = self._channel.basic_get(queue=self._count_handle, auto_ack=True)
+        def _get_count(self):
+            method, properties, body  = self._channel.basic_get(queue=self._count_handle, auto_ack=True)
+            self._channel.basic_publish(exchange = '', routing_key=self._count_handle, body=body)
             return int(body)
 
-        @_count.setter
-        def _count(self, value):
+        def _set_count(self, value):
+            print(value)
             self._channel.basic_get(queue=self._count_handle, auto_ack=True)
             self._channel.basic_publish(exchange = '', routing_key=self._count_handle,body=str(value))

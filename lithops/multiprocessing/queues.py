@@ -13,7 +13,6 @@ __all__ = ['Queue', 'SimpleQueue', 'JoinableQueue']
 import os
 import cloudpickle
 import logging
-import pika
 
 from queue import Empty, Full
 

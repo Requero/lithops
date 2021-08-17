@@ -14,6 +14,7 @@
 # Imports
 #
 
+
 import inspect
 import cloudpickle
 import logging
@@ -170,6 +171,7 @@ if 'redis'in util. mp_config.get_parameter(mp_config.CACHE):
             Return representation of the referent (or a fall-back if that fails)
             """
             return repr(self)
+
 
     #
     # Types/callables which we will register with SyncManager
@@ -951,7 +953,7 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
             else: 
                 self._client.set(self._oid, self._pickler.dumps([]))
 
-        # The following methods can't be (properly) implemented on Memcached.
+        # The following methods can't be (properly) implemented on Redis
         # The list is fetched entirely, operated in-memory and then put back to Memcached
 
         def __setitem__(self, i, obj):
@@ -1132,18 +1134,6 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
             if k not in current.keys():
                 raise KeyError(k)
             return v
-            #return self._pickler.loads(self._client.get(self._oid+str(k)))
-
-        def __delitem__(self, k):
-            """ self._client.delete(self._uuid+str(k))
-            keys = self._pickler.loads(self._client.get(self._uuid+'keys'))
-            keys.remove(self._uuid+str(k))
-            self._client.replace(self._uuid+'keys', self._pickler.dumps(keys)) """
-
-            current = self._pickler.loads(self._client.get(self._oid))
-            res = current[k]
-            del current[k]
-            self._client.set(self._oid, self._pickler.dumps(current))
 
         def __delitem__(self, k):
             current = self._pickler.loads(self._client.get(self._oid))
