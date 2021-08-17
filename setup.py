@@ -24,7 +24,8 @@ install_requires = [
     'ibm-vpc',
     'cloudpickle',
     'tblib',
-    'ps-mem'
+    'ps-mem',
+    'pymemcached'
 ]
 
 

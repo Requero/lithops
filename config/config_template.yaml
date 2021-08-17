@@ -1,6 +1,8 @@
 #lithops: 
     #backend: ibm_cf
     #storage: ibm_cos
+    #cache: redis
+    #amqp: rabbitmq
     #mode: serverless
     #data_cleaner: <True/False>
     #monitoring: storage
@@ -134,3 +136,12 @@
     #host: <ENDPOINT_URL>
     #port: <ACCESS_KEY>
     #password: <ACCESS_KEY>
+
+#redis:
+    #host: <ENDPOINT_URL>
+    #port: <ACCESS_KEY>
+    #password: <ACCESS_KEY>
+
+#memcached:
+    #host: <ENDPOINT_URL>
+    #port: <ACCESS_KEY>
