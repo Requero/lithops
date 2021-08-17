@@ -10,13 +10,12 @@
 #
 
 import time
-import socket
 import selectors
 import threading
 import random
 import io
 import logging
-
+import pika
 import cloudpickle
 
 from multiprocessing.context import BufferTooShort
@@ -47,17 +46,21 @@ NANOMSG_REQREP_CONN = 'nanomsgreqrep'  # uses TCP sockets (nanomessage)
 NANOMSG_REQREP_CONN_A = NANOMSG_REQREP_CONN + '-a-'
 NANOMSG_REQREP_CONN_B = NANOMSG_REQREP_CONN + '-b-'
 
-MEMCACHED_CONN = 'memcached'  # uses TCP sockets (nanomessage)
-MEMCACHED_CONN_A = MEMCACHED_CONN + '-a-'
-MEMCACHED_CONN_B = MEMCACHED_CONN + '-b-'
-
 NANOMSG_PUBSUB_CONN = 'nanomsgpubsub'  # uses TCP sockets (nanomessage)
 NANOMSG_PUBSUB_CONN_A = NANOMSG_PUBSUB_CONN + '-a-'
 NANOMSG_PUBSUB_CONN_B = NANOMSG_PUBSUB_CONN + '-b-'
 
-ZEROMQ_PUBSUB_CONN = 'zeromqpubsub'  # uses TCP sockets (nanomessage)
-ZEROMQ_PUBSUB_CONN_A = ZEROMQ_PUBSUB_CONN + '-a-'
-ZEROMQ_PUBSUB_CONN_B = ZEROMQ_PUBSUB_CONN + '-b-'
+MEMCACHED_CONN = 'memcached'  # uses TCP sockets (nanomessage)
+MEMCACHED_CONN_A = MEMCACHED_CONN + '-a-'
+MEMCACHED_CONN_B = MEMCACHED_CONN + '-b-'
+
+RABBITMQ_REQREP_CONN = 'rabbitmqreqrep'  # uses TCP sockets (nanomessage)
+RABBITMQ_REQREP_CONN_A = RABBITMQ_REQREP_CONN + '-a-'
+RABBITMQ_REQREP_CONN_B = RABBITMQ_REQREP_CONN + '-b-'
+
+RABBITMQ_PUBSUB_CONN = 'rabbitmqpubsub'  # uses TCP sockets (nanomessage)
+RABBITMQ_PUBSUB_CONN_A = RABBITMQ_PUBSUB_CONN + '-a-'
+RABBITMQ_PUBSUB_CONN_B = RABBITMQ_PUBSUB_CONN + '-b-'
 
 MIN_PORT = 49152
 MAX_PORT = 65536
@@ -82,8 +85,8 @@ def get_handle_pair(conn_type, from_id=None):
         return MEMCACHED_CONN_A + conn_id, MEMCACHED_CONN_B + conn_id
     elif conn_type == NANOMSG_PUBSUB_CONN:
         return NANOMSG_PUBSUB_CONN_A + conn_id, NANOMSG_PUBSUB_CONN_B + conn_id
-    elif conn_type == ZEROMQ_PUBSUB_CONN:
-        return ZEROMQ_PUBSUB_CONN_A + conn_id, ZEROMQ_PUBSUB_CONN_B + conn_id
+    elif conn_type == RABBITMQ_PUBSUB_CONN:
+        return RABBITMQ_PUBSUB_CONN_A + conn_id, RABBITMQ_PUBSUB_CONN_B + conn_id
     else:
         raise Exception('Unknown connection type {}'.format(conn_type))
 
@@ -97,23 +100,22 @@ def get_subhandle(handle):
         return REDIS_PUBSUB_CONN_B + handle[len(REDIS_PUBSUB_CONN_A):]
     elif handle.startswith(REDIS_PUBSUB_CONN_B):
         return REDIS_PUBSUB_CONN_A + handle[len(REDIS_PUBSUB_CONN_B):]
-    elif handle.startswith(NANOMSG_REQREP_CONN_A):
-        return NANOMSG_REQREP_CONN_B + handle[len(NANOMSG_REQREP_CONN_A):]
-    elif handle.startswith(NANOMSG_REQREP_CONN_B):
-        return NANOMSG_REQREP_CONN_A + handle[len(NANOMSG_REQREP_CONN_B):]
     elif handle.startswith(MEMCACHED_CONN_A):
         return MEMCACHED_CONN_B + handle[len(MEMCACHED_CONN_A):]
     elif handle.startswith(MEMCACHED_CONN_B):
         return MEMCACHED_CONN_A + handle[len(MEMCACHED_CONN_B):]
+    elif handle.startswith(NANOMSG_REQREP_CONN_A):
+        return NANOMSG_REQREP_CONN_B + handle[len(NANOMSG_REQREP_CONN_A):]
+    elif handle.startswith(NANOMSG_REQREP_CONN_B):
+        return NANOMSG_REQREP_CONN_A + handle[len(NANOMSG_REQREP_CONN_B):]
     elif handle.startswith(NANOMSG_PUBSUB_CONN_A):
         return NANOMSG_PUBSUB_CONN_B + handle[len(NANOMSG_PUBSUB_CONN_A):]
     elif handle.startswith(NANOMSG_PUBSUB_CONN_B):
         return NANOMSG_PUBSUB_CONN_A + handle[len(NANOMSG_PUBSUB_CONN_B):]
-    elif handle.startswith(ZEROMQ_PUBSUB_CONN_A):
-        return ZEROMQ_PUBSUB_CONN_B + handle[len(ZEROMQ_PUBSUB_CONN_A):]
-    elif handle.startswith(ZEROMQ_PUBSUB_CONN_B):
-        return ZEROMQ_PUBSUB_CONN_A + handle[len(ZEROMQ_PUBSUB_CONN_B):]
-
+    elif handle.startswith(RABBITMQ_PUBSUB_CONN_A):
+        return RABBITMQ_PUBSUB_CONN_B + handle[len(RABBITMQ_PUBSUB_CONN_A):]
+    elif handle.startswith(RABBITMQ_PUBSUB_CONN_B):
+        return RABBITMQ_PUBSUB_CONN_A + handle[len(RABBITMQ_PUBSUB_CONN_B):]
     raise ValueError("bad handle prefix '{}' - "
                      "see lithops.multiprocessing.connection handle prefixes".format(handle))
 
@@ -124,14 +126,12 @@ def _validate_address(address):
     if not address.startswith((REDIS_LIST_CONN, REDIS_PUBSUB_CONN, NANOMSG_REQREP_CONN, MEMCACHED_CONN)):
         raise ValueError("address '{}' is not of any known type ({}, {})".format(address,
                                                                                  REDIS_LIST_CONN,
-                                                                                 REDIS_PUBSUB_CONN))
+                                                                                 REDIS_PUBSUB_CONN,
+                                                                                 NANOMSG_CONN, 
+                                                                                 MEMCACHED_CONN))
 
 
-def get_network_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    s.connect(('<broadcast>', 0))
-    return s.getsockname()[0]
+
 
 
 #
@@ -298,7 +298,7 @@ class _ConnectionBase:
         self.close()
 
 
-if 'redis' in  mp_config.get_parameter(mp_config.CACHE):
+if 'redis' in  mp_config.get_parameter(mp_config.CACHE) and util.mp_config.get_parameter(mp_config.AMQP) == '':
 
    
     class _RedisConnection(_ConnectionBase):
@@ -543,7 +543,7 @@ if 'redis' in  mp_config.get_parameter(mp_config.CACHE):
                     return ready
             time.sleep(0.1)
 
-elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE) :
+elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE) and util.mp_config.get_parameter(mp_config.AMQP) == '':
 
     class _MemcachedConnection(_ConnectionBase):
         """
@@ -654,7 +654,7 @@ elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE) :
                 bind = False
                 while not bind:
                     try:
-                        addr = 'tcp://' + get_network_ip() + ':' + str(random.randrange(MIN_PORT, MAX_PORT))
+                        addr = 'tcp://' + util.get_network_ip() + ':' + str(random.randrange(MIN_PORT, MAX_PORT))
                         self._rep.listen(addr)
                         
                         logger.debug('Assigned server address is %s', addr)
@@ -739,7 +739,7 @@ elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE) :
             if self._handle.startswith(NANOMSG_REQREP_CONN):
                 self._rep.close()
                 self._client.delete(self._handle)
-                if self._req:
+                if self._req != None:
                     self._req.close()
                 if hasattr(self._client, 'close'):
                     self._client.close()
@@ -971,7 +971,6 @@ elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE) :
                 logger.debug('Send %i B to %s', len(buf), addr)
                 self._pub.send(buf)
                 #res = self._pub.recv()
-                #print(res)
                 #logger.debug(res)
 
         def _recv_bytes(self, maxsize=None):
@@ -1020,7 +1019,100 @@ elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE) :
                     return ready
             time.sleep(0.1)
 
+elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP) :
 
+    class _RabbitmqConnection(_ConnectionBase):
+        """
+        Connection class for Redis.
+        """
+        _write = None
+        _read = None
+
+        def __init__(self, handle, readable=True, writable=True):
+            super().__init__(handle, readable, writable)
+            logger.debug('Requested creation of Redis connection resource')
+            self._parameters = util.get_amqp_client()
+            self._handle = handle
+            self._subhandle = get_subhandle(handle)
+            self._connect()
+
+        def _connect(self):
+            if self._handle.startswith(RABBITMQ_REQREP_CONN):
+                logger.debug('Reconstruct RabbitMQ reqrep connection')
+                self._read = self._listread
+                self._write = self._listwrite
+                self._pubsub = False
+            elif self._handle.startswith(RABBITMQ_PUBSUB_CONN):
+                logger.debug('Reconstruct RabbitMQ pubsub connection')
+                self._parameters = self._parameters
+                self._connection = pika.BlockingConnection(self._parameters)
+                self._channel = self._connection.channel()
+                self._channel.exchange_declare(exchange='exchange-'+self._subhandle, exchange_type='fanout')
+                self._channel.queue_declare(queue=self._subhandle)
+                self._channel.queue_bind(exchange='exchange-'+self._subhandle, queue=self._subhandle)
+                self._read = self._channelread
+                self._write = self._channelwrite
+                self._pubsub = True
+            else:
+                raise Exception('Unknown connection type {}'.format(self._handle))
+
+        def __getstate__(self):
+            return (self._parameters, self._handle, self._subhandle,
+                    self._readable, self._writable)
+
+        def __setstate__(self, state):
+            (self._parameters, self._handle, self._subhandle,
+            self._readable, self._writable) = state
+            self._connect()
+
+        def __len__(self):
+            queue_state = self._channel.queue_declare(queue=self._subhandle, passive = True)
+            return queue_state.method.message_count
+
+        def _set_expiry(self, key):
+            logger.debug('Set key %s expiry time', key)
+            #self._client.expire(key, mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
+            #self._set_expiry = lambda key: None
+
+        def _close(self, _close=None):
+            if hasattr(self._connection, 'close'):
+                self._connection.close()
+
+        def _channelwrite(self, handle, buf):
+            return self._channel.basic_publish(exchange='exchange-'+handle,routing_key=handle,body=buf)
+
+        def _channelread(self, handle):
+            global res
+            res = None
+            def callback(ch, method, properties, body):
+                global res
+                res = body
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+                ch.stop_consuming()
+            #self._channel.basic_qos(prefetch_count=1)
+            self._channel.basic_consume(queue=handle, on_message_callback=callback)
+            self._channel.start_consuming()
+            return res
+
+        def _send(self, buf, write=None):
+            raise NotImplementedError('Connection._send() on Redis')
+
+        def _recv(self, size, read=None):
+            raise NotImplementedError('Connection._recv() on Redis')
+
+        def _send_bytes(self, buf):
+            self._write(self._subhandle, buf)
+
+        def _recv_bytes(self, maxsize=None):
+            msg = self._read(self._handle)
+            return msg
+
+        def _poll(self, timeout):
+            if self._pubsub:
+                r = wait([(self._pubsub, self._handle)], timeout)
+            else:
+                r = wait([(self._client, self._handle)], timeout)
+            return bool(r)
 
 #
 # Public functions
@@ -1097,6 +1189,8 @@ def Pipe(duplex=True, conn_type=None):
         connection = _NanomsgConnection
     elif conn_type == MEMCACHED_CONN:
         connection = _MemcachedConnection
+    elif conn_type == RABBITMQ_PUBSUB_CONN:
+        connection = _RabbitmqConnection
     else:
         raise Exception('Unknown connection type {}'.format(conn_type))
 

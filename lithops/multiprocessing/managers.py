@@ -14,6 +14,7 @@
 # Imports
 #
 
+
 import inspect
 import cloudpickle
 import logging
@@ -78,7 +79,6 @@ if 'redis'in util. mp_config.get_parameter(mp_config.CACHE):
         _registry = {}
 
         def __init__(self, address=None, authkey=None, serializer='pickle', ctx=None):
-            #self._client = util.get_redis_client()
             self._client = util.get_cache_client()
             self._managing = False
             self._mrefs = []
@@ -158,9 +158,8 @@ if 'redis'in util. mp_config.get_parameter(mp_config.CACHE):
             self._typeid = typeid
             # object id
             self._oid = '{}-{}'.format(typeid, util.get_uuid())
-            self._oid = self._oid.replace(" ", "")
+
             self._pickler = cloudpickle
-            #self._client = util.get_redis_client()
             self._client = util.get_cache_client()
             self._ref = util.RemoteReference(self._oid, client=self._client)
 
@@ -264,7 +263,6 @@ if 'redis'in util. mp_config.get_parameter(mp_config.CACHE):
                 shared = self._shared_object.__shared__
 
             pipeline = self._proxy._client.pipeline()
-
             for attr_name in shared:
                 attr = getattr(self._shared_object, attr_name)
                 attr_bin = self._proxy._pickler.dumps(attr)
@@ -314,6 +312,7 @@ if 'redis'in util. mp_config.get_parameter(mp_config.CACHE):
             super().__init__('list')
             self._lua_extend_list = self._client.register_script(ListProxy.LUA_EXTEND_LIST_SCRIPT)
             util.make_stateless_script(self._lua_extend_list)
+
             if iterable is not None:
                 self.extend(iterable)
 
@@ -945,28 +944,6 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
 
 
     class ListProxy(BaseProxy):
-        # NOTE: list slices should return an instance of a ListProxy
-        #       or a native python list?
-        #
-        #          A = ListProxy([1, 2, 3])
-        #          B = A[:2]
-        #          C = A + [4, 5]
-        #          D = A * 3
-        #
-        #        Following the multiprocessing implementation, lists (B,
-        #        C, D) are plain python lists while A is the only ListProxy.
-        #        This could cause problems like these:
-        #
-        #          A = A[2:]
-        #
-        #        with A being a python list after executing that line.
-        #
-        #        Current implementation is the same as multiprocessing
-
-        # KEYS[1] - key to extend
-        # KEYS[2] - key to extend with
-        # ARGV[1] - number of repetitions
-        # A = A + B * C
 
         def __init__(self, iterable=None):
             super().__init__('list')
@@ -976,6 +953,9 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
             else: 
                 self._client.set(self._oid, self._pickler.dumps([]))
 
+        # The following methods can't be (properly) implemented on Redis
+        # The list is fetched entirely, operated in-memory and then put back to Memcached
+
         def __setitem__(self, i, obj):
             if isinstance(i, int) or hasattr(i, '__index__'):
                 idx = i.__index__()
@@ -1004,10 +984,6 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
                     self._client.set(self._oid, self._pickler.dumps(current))
                 except StopIteration:
                     pass
-                except redis.exceptions.ResponseError:
-                    # raised when index >= len(self)
-                    self.extend(iterable)
-                    return
                 except TypeError:
                     raise TypeError('can only assign an iterable')
             else:
@@ -1017,14 +993,17 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
         def __getitem__(self, i):
             if isinstance(i, int) or hasattr(i, '__index__'):
                 idx = i.__index__()
-                return self._pickler.loads(self._client.get(self._oid))[idx]
+                serialized = self._pickler.loads(self._client.get(self._oid))
+                if serialized is not None:
+                    return serialized[i]
                 raise IndexError('list index out of range')
 
             elif isinstance(i, slice):  # TODO: step
                 start, end, step = deslice(i)
                 if start is None:
                     return []
-                return self._pickler.loads(self._client.get(self._oid))[start:end]
+                serialized = self._pickler.loads(self._client.get(self._oid))
+                return serialized[start:end]
             else:
                 raise TypeError('list indices must be integers '
                                 'or slices, not {}'.format(type(i)))
@@ -1055,10 +1034,6 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
 
         def __deepcopy__(self, memo):
             selfcopy = type(self)()
-
-            # We should test the DUMP/RESTORE strategy 
-            # although it has serialization costs
-            selfcopy._extend_same_type(self)
             
             memo[id(self)] = selfcopy
 
@@ -1099,220 +1074,8 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
                 raise TypeError("TypeError: can't multiply sequence"
                                 " by non-int of type {}".format(type(n)))
             if n > 1:
-                self._extend_same_type(self, repeat=n - 1)
-            return self
-
-        def __len__(self):
-            return len(self._pickler.loads(self._client.get(self._oid)))
-
-        def remove(self, obj):
-            current = self._pickler.loads(self._client.get(self._oid))
-            current.remove(obj)
-            self._client.set(self._oid, self._pickler.dumps(current))
-            return self
-
-        def __delitem__(self, i):
-            sentinel = util.get_uuid()
-            self[i] = sentinel
-            self.remove(sentinel)
-
-        def tolist(self):
-            return self._pickler.loads(self._client.get(self._oid))
-
-        # The following methods can't be (properly) implemented on Redis
-        # To still provide the functionality, the list is fetched
-        # entirely, operated in-memory and then put back to Redis
-
-        def reverse(self):
-            #rev = reversed(self[:])
-            #self._client.delete(self._oid)
-            #self.extend(rev)
-            current = self._pickler.loads(self._client.get(self._oid))
-            current.reverse()
-            self._client.set(self._oid, self._pickler.dumps(current))
-            return self
-
-        def sort(self, key=None, reverse=False):
-            #sortd = sorted(self[:], key=key, reverse=reverse)
-            #self._client.delete(self._oid)
-            #self.extend(sortd)
-            current = self._pickler.loads(self._client.get(self._oid))
-            current.sort()
-            self._client.set(self._oid, self._pickler.dumps(current))
-            return self
-
-        def index(self, obj, start=0, end=-1):
-            return self[:].index(obj, start, end)
-
-        def count(self, obj):
-            return self[:].count(obj)
-
-        def insert(self, index, obj):
-            #new_list = self[:]
-            #new_list.insert(index, obj)
-            #self._client.delete(self._oid)
-            #self.extend(new_list)
-            current = self._pickler.loads(self._client.get(self._oid))
-            current.insert(index, obj)
-            self._client.set(self._oid, self._pickler.dumps(current))
-
-
-    class ListProxy1(BaseProxy):
-        # NOTE: list slices should return an instance of a ListProxy
-        #       or a native python list?
-        #
-        #          A = ListProxy([1, 2, 3])
-        #          B = A[:2]
-        #          C = A + [4, 5]
-        #          D = A * 3
-        #
-        #        Following the multiprocessing implementation, lists (B,
-        #        C, D) are plain python lists while A is the only ListProxy.
-        #        This could cause problems like these:
-        #
-        #          A = A[2:]
-        #
-        #        with A being a python list after executing that line.
-        #
-        #        Current implementation is the same as multiprocessing
-
-        # KEYS[1] - key to extend
-        # KEYS[2] - key to extend with
-        # ARGV[1] - number of repetitions
-        # A = A + B * C
-
-        def __init__(self, iterable=None):
-            super().__init__('list')
-            
-            if iterable is not None:
-                self._client.set(self._oid, self._pickler.dumps(list(iterable)))
-
-        def __setitem__(self, i, obj):
-            if isinstance(i, int) or hasattr(i, '__index__'):
-                idx = i.__index__()
-                current = self._pickler.loads(self._client.get(self._oid))
-                try:
-                    current[i] = obj
-                    self._client.set(self._oid, self._pickler.dumps(current))
-                except IndexError:
-                    # raised when index >= len(self)
-                    raise IndexError('list assignment index out of range')
-
-            elif isinstance(i, slice):  # TODO: step
-                start, end, step = deslice(i)
-                if start is None:
-                    return
-
-                if end < 0:
-                    end = len(self) + end
-
-                try:
-                    iterable = iter(obj)
-                    current = self._pickler.loads(self._client.get(self._oid))
-                    for j in range(start, end):
-                        obj = next(iterable)
-                        current[j]=obj
-                    self._client.set(self._oid, self._pickler.dumps(current))
-                except StopIteration:
-                    pass
-                except redis.exceptions.ResponseError:
-                    # raised when index >= len(self)
-                    self.extend(iterable)
-                    return
-                except TypeError:
-                    raise TypeError('can only assign an iterable')
-            else:
-                raise TypeError('list indices must be integers '
-                                'or slices, not {}'.format(type(i)))
-
-        def __getitem__(self, i):
-            if isinstance(i, int) or hasattr(i, '__index__'):
-                idx = i.__index__()
-                return self._pickler.loads(self._client.get(self._oid))[idx]
-                raise IndexError('list index out of range')
-
-            elif isinstance(i, slice):  # TODO: step
-                start, end, step = deslice(i)
-                if start is None:
-                    return []
-                return self._pickler.loads(self._client.get(self._oid))[start:end]
-            else:
-                raise TypeError('list indices must be integers '
-                                'or slices, not {}'.format(type(i)))
-
-        def extend(self, iterable):
-            if iterable != []:
-                current = self._pickler.loads(self._client.get(self._oid))
-                current.extend(iterable)
-                self._client.set(self._oid, self._pickler.dumps(current))
-
-        def append(self, obj):
-            current = self._pickler.loads(self._client.get(self._oid))
-            current.append(obj)
-            self._client.set(self._oid, self._pickler.dumps(current))
-
-        def pop(self, index=None):
-            if index is None:
-                current = self._pickler.loads(self._client.get(self._oid))
-                item = current.pop()
-                self._client.set(self._oid, self._pickler.dumps(current))
-                return item
-            else:
-                item = self[index]
-                sentinel = util.get_uuid()
-                self[index] = sentinel
-                self.remove(sentinel)
-                return item
-
-        def __deepcopy__(self, memo):
-            selfcopy = type(self)()
-
-            # We should test the DUMP/RESTORE strategy 
-            # although it has serialization costs
-            selfcopy._extend_same_type(self)
-            
-            memo[id(self)] = selfcopy
-
-            #current = self._pickler.loads(self._client.get(self._oid)
-            return selfcopy
-
-        def __add__(self, x):
-            # FIXME: list only allows concatenation to other list objects
-            #        (altough it can now be extended by iterables)
-            # newlist = deepcopy(self)
-            # return newlist.__iadd__(x)
-            return self[:] + x
-
-        def __iadd__(self, x):
-            # FIXME: list only allows concatenation to other list objects
-            #        (altough it can now be extended by iterables)
-            self.extend(x)
-            return self
-
-        def __mul__(self, n):
-            if not isinstance(n, int):
-                raise TypeError("TypeError: can't multiply sequence"
-                                " by non-int of type {}".format(type(n)))
-            if n < 1:
-                # return type(self)()
-                return []
-            else:
-                # newlist = type(self)()
-                # newlist._extend_same_type(self, repeat=n)
-                # return newlist
                 return self[:] * n
 
-        def __rmul__(self, n):
-            return self.__mul__(n)
-
-        def __imul__(self, n):
-            if not isinstance(n, int):
-                raise TypeError("TypeError: can't multiply sequence"
-                                " by non-int of type {}".format(type(n)))
-            if n > 1:
-                self._extend_same_type(self, repeat=n - 1)
-            return self
-
         def __len__(self):
             return len(self._pickler.loads(self._client.get(self._oid)))
 
@@ -1330,23 +1093,13 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
         def tolist(self):
             return self._pickler.loads(self._client.get(self._oid))
 
-        # The following methods can't be (properly) implemented on Redis
-        # To still provide the functionality, the list is fetched
-        # entirely, operated in-memory and then put back to Redis
-
         def reverse(self):
-            #rev = reversed(self[:])
-            #self._client.delete(self._oid)
-            #self.extend(rev)
             current = self._pickler.loads(self._client.get(self._oid))
             current.reverse()
             self._client.set(self._oid, self._pickler.dumps(current))
             return self
 
         def sort(self, key=None, reverse=False):
-            #sortd = sorted(self[:], key=key, reverse=reverse)
-            #self._client.delete(self._oid)
-            #self.extend(sortd)
             current = self._pickler.loads(self._client.get(self._oid))
             current.sort()
             self._client.set(self._oid, self._pickler.dumps(current))
@@ -1359,10 +1112,6 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
             return self[:].count(obj)
 
         def insert(self, index, obj):
-            #new_list = self[:]
-            #new_list.insert(index, obj)
-            #self._client.delete(self._oid)
-            #self.extend(new_list)
             current = self._pickler.loads(self._client.get(self._oid))
             current.insert(index, obj)
             self._client.set(self._oid, self._pickler.dumps(current))
@@ -1372,21 +1121,12 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
 
         def __init__(self, *args, **kwargs):
             super().__init__('dict')
-            """ temp = dict(**kwargs)
-            keys = []
-            for k,v in temp.items():
-                keys.append(self._uuid+str(k))
-                self._client.set(self._uuid+str(k), self._pickler.dumps(v))
-            self._client.set(self._uuid+'keys', self._pickler.dumps(keys)) """
-            
             self.update( *args, **kwargs)
-            #self._client.set(self._oid, self._pickler.dumps(kwargs))
 
         def __setitem__(self, k, v):
             current = self._pickler.loads(self._client.get(self._oid))
             current[k]=v
             self._client.set(self._oid, self._pickler.dumps(current))
-            #self._client.set(self._oid+str(k), self._pickler.dumps(v))
 
         def __getitem__(self, k):
             current = self._pickler.loads(self._client.get(self._oid))
@@ -1394,25 +1134,16 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
             if k not in current.keys():
                 raise KeyError(k)
             return v
-            #return self._pickler.loads(self._client.get(self._oid+str(k)))
 
         def __delitem__(self, k):
-            """ self._client.delete(self._uuid+str(k))
-            keys = self._pickler.loads(self._client.get(self._uuid+'keys'))
-            keys.remove(self._uuid+str(k))
-            self._client.replace(self._uuid+'keys', self._pickler.dumps(keys)) """
-
             current = self._pickler.loads(self._client.get(self._oid))
             res = current[k]
             del current[k]
             self._client.set(self._oid, self._pickler.dumps(current))
-
             #if res == 0:
             #    raise KeyError(k)
 
         def __contains__(self, k):
-            """ keys = self._pickler.loads(self._client.get(self._oid+str(k)))
-            self._client """
             current = self._pickler.loads(self._client.get(self._oid))
             return current.contains(k)
 
@@ -1452,15 +1183,9 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
             current = self._pickler.loads(self._client.get(self._oid))
             res = current.setdefault(k,default)
             self._client.set(self._oid, self._pickler.dumps(current))
-            """ res = self._client.get(self._uuid+str(k))
-            self._client.set(self._uuid+str(k), self._pickler.dumps(default)) """
             return res
 
         def update(self, *args, **kwargs):
-            #print('ar')
-            #print(*args)
-            #print('kw')
-            #print(kwargs)
             temp = self._client.get(self._oid)
             if temp == None:
                 current = dict( *args, **kwargs)
@@ -1488,124 +1213,11 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
             self._client.set(self._oid, self._pickler.dumps(current))
 
         def copy(self):
-            # TODO: use lua script
             return type(self)(self.items())
 
         def todict(self):
             return self._pickler.loads(self._client.get(self._oid))
 
-
-    class DictProxy1(BaseProxy):
-
-        def __init__(self, **kwargs):
-            super().__init__('dict')
-            temp = dict(**kwargs)
-            keys = []
-            for k,v in temp.items():
-                keys.append(self._uuid+str(k))
-                self._client.set(self._uuid+str(k), self._pickler.dumps(v))
-            self._client.set(self._uuid+'keys', self._pickler.dumps(keys))
-
-        def __setitem__(self, k, v):
-            current = self._pickler.loads(self._client.get(self._oid))
-            current[k]=v
-            self._client.set(self._oid, self._pickler.dumps(current))
-            #self._client.set(self._oid+str(k), self._pickler.dumps(v))
-
-        def __getitem__(self, k):
-            current = self._pickler.loads(self._client.get(self._oid))
-            v = current[k]
-            if k not in current.keys():
-                raise KeyError(k)
-            return v
-            #return self._pickler.loads(self._client.get(self._oid+str(k)))
-
-        def __delitem__(self, k):
-            """ self._client.delete(self._uuid+str(k))
-            keys = self._pickler.loads(self._client.get(self._uuid+'keys'))
-            keys.remove(self._uuid+str(k))
-            self._client.replace(self._uuid+'keys', self._pickler.dumps(keys)) """
-
-            current = self._pickler.loads(self._client.get(self._oid))
-            res = current[k]
-            del current[k]
-            self._client.set(self._oid, self._pickler.dumps(current))
-
-            #if res == 0:
-            #    raise KeyError(k)
-
-        def __contains__(self, k):
-            """ keys = self._pickler.loads(self._client.get(self._oid+str(k)))
-            self._client """
-            current = self._pickler.loads(self._client.get(self._oid))
-            return current.contains(k)
-
-        def __len__(self):
-            return len(self._pickler.loads(self._client.get(self._oid)))
-
-        def __iter__(self):
-            return iter(self.keys())
-
-        def get(self, k, default=None):
-            try:
-                v = self.__getitem__(k)
-            except KeyError:
-                return default
-            else:
-                return v
-
-        def pop(self, k, default=None):
-            try:
-                v = self.__getitem__(k)
-            except KeyError:
-                return default
-            else:
-                self.__delitem__(k)
-                return v
-
-        def popitem(self):
-            try:
-                key = self.keys()[0]
-                item = (key, self.__getitem__(key))
-                self.__delitem__(key)
-                return item
-            except IndexError:
-                raise KeyError('popitem(): dictionary is empty')
-
-        def setdefault(self, k, default=None):
-            current = self._pickler.loads(self._client.get(self._oid))
-            res = current.setdefault(k,default)
-            self._client.set(self._oid, self._pickler.dumps(current))
-            """ res = self._client.get(self._uuid+str(k))
-            self._client.set(self._uuid+str(k), self._pickler.dumps(default)) """
-            return res
-
-        def update(self, **kwargs):
-            current = self._pickler.loads(self._client.get(self._oid))
-            current.update(kwargs)
-            self._client.set(self._oid, self._pickler.dumps(current))
-
-        def keys(self):
-            return self._pickler.loads(self._client.get(self._oid)).keys()
-
-        def values(self):
-            return self._pickler.loads(self._client.get(self._oid)).values()
-
-        def items(self):
-            return self._pickler.loads(self._client.get(self._oid)).items()
-
-        def clear(self):
-            current = self._pickler.loads(self._client.get(self._oid))
-            current.clear()
-            self._client.set(self._oid, self._pickler.dumps(current))
-
-        def copy(self):
-            # TODO: use lua script
-            return type(self)(self.items())
-
-        def todict(self):
-            return self._pickler.loads(self._client.get(self._oid))
-    
 
     class NamespaceProxy(BaseProxy):
         def __init__(self, **kwargs):
@@ -1674,8 +1286,6 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
 
     SyncManager.register('list', ListProxy)
     SyncManager.register('dict', DictProxy)
-    SyncManager.register('list1', ListProxy1)
-    SyncManager.register('dict1', DictProxy1)
     SyncManager.register('Namespace', NamespaceProxy)
     SyncManager.register('Lock', synchronize.Lock)
     SyncManager.register('RLock', synchronize.RLock)

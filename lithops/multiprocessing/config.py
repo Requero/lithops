@@ -20,9 +20,10 @@ STREAM_STDOUT = 'STREAM_STDOUT'  # Enable remote logging
 ENV_VARS = 'ENV_VARS'  # Processes environment variables
 
 CACHE = 'CACHE'
+AMQP = 'AMQP'
 # Middleware configuration parameters
 PIPE_CONNECTION_TYPE = 'PIPE_CONNECTION_TYPE'  # Pipe/Queue connection type
-
+EXPORT_EXECUTION_DETAILS = 'EXPORT_EXECUTION_DETAILS'
 # Redis specific parameters
 #REDIS_EXPIRY_TIME = 'REDIS_EXPIRY_TIME'  # Redis key expiry time in seconds
 CACHE_EXPIRY_TIME = 'CACHE_EXPIRY_TIME'
@@ -31,23 +32,31 @@ from lithops.config import load_config
 
 if 'redis' in load_config()['lithops']['cache'] :
     _DEFAULT_CONFIG = {
+        CACHE: 'redis',
         LITHOPS_CONFIG: {},
         STREAM_STDOUT: False,
         CACHE_EXPIRY_TIME: 3600,  # 1 hour
         PIPE_CONNECTION_TYPE: 'redislist',
         ENV_VARS: {},
-        CACHE: 'redis',
+        EXPORT_EXECUTION_DETAILS: False
     }
 elif 'memcached' in load_config()['lithops']['cache']:
     _DEFAULT_CONFIG = {
+        CACHE: 'memcached',
         LITHOPS_CONFIG: {},
         STREAM_STDOUT: False,
         CACHE_EXPIRY_TIME: 3600,  # 1 hour
         PIPE_CONNECTION_TYPE: 'nanomsgreqrep',
         ENV_VARS: {}, 
-        CACHE: 'memcached',
+        EXPORT_EXECUTION_DETAILS: False
     }
 
+try: 
+    if 'rabbitmq' in load_config()['lithops']['amqp'] :
+        _DEFAULT_CONFIG[AMQP] = 'rabbitmq'
+        _DEFAULT_CONFIG[PIPE_CONNECTION_TYPE] = 'rabbitmqpubsub'
+except:
+    _DEFAULT_CONFIG[AMQP] = ''
 
 _config = _DEFAULT_CONFIG
 

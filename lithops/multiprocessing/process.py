@@ -1,3 +1,4 @@
+
 #
 # Module providing the `Process` class which emulates `threading.Thread`
 #
@@ -138,7 +139,6 @@ class CloudProcess:
         self._config = {}
         self._parent_pid = os.getpid()
         self._target = target
-        
         self._args = tuple(args)
         self._kwargs = dict(kwargs)
         self._name = name or (type(self).__name__ + '-' + str(next(_process_counter)))
@@ -150,7 +150,7 @@ class CloudProcess:
         self._future = None
         self._sentinel = object()
         self._remote_logger = None
-        self._cache = util.get_cache_client()
+        self._cache= util.get_cache_client()
 
     def run(self):
         """
@@ -207,6 +207,9 @@ class CloudProcess:
         finally:
             if self._remote_logger:
                 self._remote_logger.stop()
+
+            util.export_execution_details([self._future], self._executor)
+
             if exception:
                 raise exception
 

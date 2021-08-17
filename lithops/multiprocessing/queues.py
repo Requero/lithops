@@ -10,11 +10,9 @@
 #
 
 __all__ = ['Queue', 'SimpleQueue', 'JoinableQueue']
-
 import os
 import cloudpickle
 import logging
-import pika
 
 from queue import Empty, Full
 
@@ -25,7 +23,8 @@ from . import config as mp_config
 
 logger = logging.getLogger(__name__)
 
-if 'redis' in  mp_config.get_parameter(mp_config.CACHE):
+if 'redis' in  mp_config.get_parameter(mp_config.CACHE) and '' ==  mp_config.get_parameter(mp_config.AMQP):
+
     #
     # Queue type using a pipe, buffer and thread
     #
@@ -123,6 +122,7 @@ if 'redis' in  mp_config.get_parameter(mp_config.CACHE):
         def cancel_join_thread(self):
             logger.debug('Queue.cancel_join_thread()')
             pass
+            
 
 
     #
@@ -216,7 +216,7 @@ if 'redis' in  mp_config.get_parameter(mp_config.CACHE):
                 if self._unfinished_tasks.get_value() != 0:
                     self._cond.wait()
 
-elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE):
+elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE) and '' ==  mp_config.get_parameter(mp_config.AMQP):
     #
     # Queue type using a pipe, buffer and thread
     #
@@ -400,14 +400,16 @@ elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE):
                     raise ValueError('task_done() called too many times')
                 if self._unfinished_tasks.get_value() == 0:
                     self._cond.notify_all()
-                    print('notify')
 
         def join(self):
             with self._cond:
                 if self._unfinished_tasks.get_value() != 0:
                     self._cond.wait()
 
-elif 'rabbitmq' in  mp_config.get_parameter(mp_config.CACHE):
+elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
+
+    import time
+    import pika
     #
     # Queue type using a pipe, buffer and thread
     #
@@ -418,31 +420,24 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.CACHE):
         Full = Full
 
         def __init__(self, maxsize=0):
-            self._opid = os.getpid()
-            self._parameters = pika.ConnectionParameters('localhost')
+            self._opid = 'queue'+str(os.getpid())
+            self._parameters = util.get_amqp_client()
+            self._closed = False
+            self._maxsize = maxsize
             self._connection = pika.BlockingConnection(self._parameters)
-            self._channel = connection.channel()
-            if maxsize > 0:
-                args = {"x-max-length":str(maxsize)}
+            self._channel = self._connection.channel()
+            if self._maxsize > 0:
+                args = {"x-max-length":maxsize}
             else:
                 args = {}
-            self._channel.exchange_declare(exchange='logs',exchange_type='fanout')
-            self._channel.queue_declare(queue=self._opid,auto_delete=False,arguments =args)
-            """ 
-            self._reader, self._writer = connection.Pipe(duplex=False, conn_type=connection.MEMCACHED_CONN)
-            self._ref = util.RemoteReference(referenced=[self._reader._handle, self._reader._subhandle],
-                                            client=self._reader._client) 
-            """
-            self._maxsize = maxsize
+            self._channel.queue_declare(queue=self._opid,arguments =args)
             self._after_fork()
 
         def __getstate__(self):
-            return (self._maxsize, self._parameters,self._connection,
-                    self._channel, self._opid, self._ref)
+            return (self._maxsize, self._parameters, self._opid)
 
         def __setstate__(self, state):
-            (self._maxsize,self._parameters,self._connection,
-            self._channel, self._opid, self._ref) = state
+            (self._maxsize,self._parameters, self._opid) = state
             self._after_fork()
 
         @property
@@ -456,12 +451,11 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.CACHE):
             logger.debug('Queue._after_fork()')
             self._closed = False
             self._close = None
+            self._maxsize = self._maxsize
             self._parameters = self._parameters
-            self._connection = self._connection
-            self._channel = self._channel
-            #self._send_bytes = self._writer.send#_bytes
-            #self._recv_bytes = self._reader.recv#_bytes
-            #self._poll = self._reader.poll
+            self._connection = pika.BlockingConnection(self._parameters)
+            self._channel = self._connection.channel()
+
 
         def put(self, obj, block=True, timeout=None):
             if self._closed:
@@ -469,42 +463,44 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.CACHE):
                 
             if self._notfull:
                 obj = cloudpickle.dumps(obj)
-                #self._send_bytes(obj)
-                self._channel.basic_publish(exchange='',routing_key=self._opid,body=obj)
-                #connection.close()
+                self._channel.basic_publish(routing_key=self._opid,body=obj)
+
 
         def get(self, block=True, timeout=None):
-            res = None
-            if block:
-                if timeout is None:
-
-                    def callback(ch, method, properties, body):
-                        #print(" [x] Received %r" % body.decode())
-                        #time.sleep(body.count(b'.'))
-                        #print(" [x] Done")
-                        #ch.basic_ack(delivery_tag=method.delivery_tag)
-                        res = body
-                        ch.stop_consuming()
-
-                    #print(channel.get_waiting_message_count())
-                    channel.basic_qos(prefetch_count=1)
-                    channel.basic_consume(queue=self._opid, on_message_callback=callback)
-                    channel.start_consuming()
+            
+            if block and timeout is None:
+                global res
+                res = None
+                def callback(ch, method, properties, body):
+                    global res
+                    ch.stop_consuming()
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    res = body
+                #self._channel.basic_qos(prefetch_count=1)
+                self._channel.basic_consume(queue=self._opid, on_message_callback=callback)
+                self._channel.start_consuming()
+                return cloudpickle.loads(res)
             else:
-                method, properties, body  = self._channel.basic_get(queue=self._opid, auto_ack  = True)
+                res = None
+                if block:
+                    if not self._poll(timeout):
+                        raise Empty
+                elif not self._poll():
+                    raise Empty
+                method, properties, body  = self._channel.basic_get(queue=self._opid, auto_ack=False)
                 res = body
-            return cloudpickle.loads(res)
+                return cloudpickle.loads(res)
 
         def qsize(self):
-            queue_state = self._channel.queue_declare(queue=self._opid, durable=True, passive = True)
+            queue_state = self._channel.queue_declare(queue=self._opid, passive = True)
             return queue_state.method.message_count
 
         def empty(self):
-            queue_state = self._channel.queue_declare(queue=self._opid, durable=True, passive = True)
+            queue_state = self._channel.queue_declare(queue=self._opid, passive = True)
             return queue_state.method.message_count == 0
 
         def full(self):
-            queue_state = self._channel.queue_declare(queue=self._opid, durable=True, passive = True)
+            queue_state = self._channel.queue_declare(queue=self._opid, passive = True)
             return queue_state.method.message_count == self.maxsize
 
         def get_nowait(self):
@@ -528,7 +524,15 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.CACHE):
             logger.debug('Queue.cancel_join_thread()')
             pass
 
-
+        def _poll(self, timeout):
+            max_time = time.monotonic() + timeout
+            while time.monotonic() < max_time:
+                qsize = self.qsize()
+                if qsize > 0:
+                    return True
+                else:
+                    time.sleep(0.1)
+            return False
 
     #
     # Simplified Queue type
@@ -536,54 +540,68 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.CACHE):
 
     class SimpleQueue:
         def __init__(self):
-            """ self._reader, self._writer = connection.Pipe(duplex=False, conn_type=connection.MEMCACHED_CONN)
-            self._ref = util.RemoteReference(referenced=[self._reader._handle, self._reader._subhandle],
-                                            client=self._reader._client)
-            self._poll = self._reader.poll """
-            self._opid = os.getpid()
-            self._parameters = pika.ConnectionParameters('localhost')
+            self._opid = 'simplequeue'+str(os.getpid())
+            self._parameters = util.get_amqp_client()
+            self._closed = False
             self._connection = pika.BlockingConnection(self._parameters)
-            self._channel = connection.channel()
-            self._channel.queue_declare(queue=self._opid,auto_delete=False)
-            self._maxsize = maxsize
+            self._channel = self._connection.channel()
+            self._channel.queue_declare(queue=self._opid)
             self._after_fork()
 
-        def put(self, obj, block=True, timeout=None):
-            assert not self._closed
+        def __getstate__(self):
+            return (self._parameters, self._opid)
 
+        def __setstate__(self, state):
+            (self._parameters, self._opid) = state
+            self._after_fork()
+
+        def _after_fork(self):
+            logger.debug('Queue._after_fork()')
+            self._closed = False
+            self._close = None
+            self._parameters = self._parameters
+            self._connection = pika.BlockingConnection(self._parameters)
+            self._channel = self._connection.channel()
+
+
+        def put(self, obj, block=True, timeout=None):
+            if self._closed:
+                raise ValueError(f"Queue {self!r} is closed")
+                
             obj = cloudpickle.dumps(obj)
-            #self._send_bytes(obj)
             self._channel.basic_publish(exchange='',routing_key=self._opid,body=obj)
-            connection.close()
+
 
         def get(self, block=True, timeout=None):
-            res = None
-            if block:
-                if timeout is None:
-
-                    def callback(ch, method, properties, body):
-                        #print(" [x] Received %r" % body.decode())
-                        #time.sleep(body.count(b'.'))
-                        #print(" [x] Done")
-                        #ch.basic_ack(delivery_tag=method.delivery_tag)
-                        res = body
-                        ch.stop_consuming()
-
-                    #print(channel.get_waiting_message_count())
-                    channel.basic_qos(prefetch_count=1)
-                    channel.basic_consume(queue=self._opid, on_message_callback=callback)
-                    channel.start_consuming()
+            
+            if block and timeout is None:
+                global res
+                res = None
+                def callback(ch, method, properties, body):
+                    global res
+                    res = body
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    ch.stop_consuming()
+                #self._channel.basic_qos(prefetch_count=1)
+                self._channel.basic_consume(queue=self._opid, on_message_callback=callback)
+                self._channel.start_consuming()
             else:
-                method, properties, body  = self._channel.basic_get(queue=self._opid, auto_ack  = True)
+                res = None
+                if block:
+                    if not self._poll(timeout):
+                        raise Empty
+                elif not self._poll():
+                    raise Empty
+                method, properties, body  = self._channel.basic_get(queue=self._opid, auto_ack=False)
                 res = body
             return cloudpickle.loads(res)
 
         def qsize(self):
-            queue_state = self._channel.queue_declare(queue=self._opid, durable=True, passive = True)
-            return queue_state.method.message_count == 0
+            queue_state = self._channel.queue_declare(queue=self._opid, passive = True)
+            return queue_state.method.message_count
 
         def empty(self):
-            queue_state = self._channel.queue_declare(queue=self._opid, durable=True, passive = True)
+            queue_state = self._channel.queue_declare(queue=self._opid, passive = True)
             return queue_state.method.message_count == 0
 
         def full(self):
@@ -596,9 +614,21 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.CACHE):
             return self.put(obj)
 
         def close(self):
-            if not self._closed:
+            self._closed = True
+            try:
                 self._connection.close()
-                self._closed = True
+            finally:
+                self._close = None
+        
+        def _poll(self, timeout):
+            max_time = time.monotonic() + timeout
+            while time.monotonic() < max_time:
+                qsize = self.qsize()
+                if qsize > 0:
+                    return True
+                else:
+                    time.sleep(0.1)
+            return False
 
 
     #
@@ -608,35 +638,36 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.CACHE):
     class JoinableQueue(Queue):
         def __init__(self):
             super().__init__()
-            #self._unfinished_tasks = synchronize.Semaphore(0)
-            #self._cond = synchronize.Condition()
+            self._channel.exchange_declare(exchange='exchange-condition-'+self._opid, exchange_type='fanout')
+            self._channel.queue_declare(queue='condition-'+self._opid)
+            self._channel.queue_bind(exchange='exchange-condition-'+self._opid, queue='condition-'+self._opid)
+
+        def _afterfork(self):
+            super()._afterfork()
+            #self._channel.exchange_declare(exchange=self._opid+'exchangecondition', exchange_type='fanout')
+            #self._channel.queue_declare(queue=self._opid+'condition')
 
         def __getstate__(self):
-            return (self._maxsize, self._parameters,self._connection,
-                    self._channel, self._opid, self._ref)
+            return (self._maxsize, self._parameters, self._opid)
 
         def __setstate__(self, state):
-            (self._maxsize, self._parameters,self._connection,
-            self._channel, self._opid, self._ref) = state
+            (self._maxsize, self._parameters, self._opid) = state
             self._after_fork()
 
-        def put(self, obj, block=True, timeout=None):
-            print('put')
-            with self._cond:
-                super().put(obj)
-                self._unfinished_tasks.release() 
-
         def task_done(self):
-            with self._cond:
-
-                if not self._unfinished_tasks.acquire(False):
-                    raise ValueError('task_done() called too many times')
-                
-                if self._unfinished_tasks.get_value() == 0:
-                    self._cond.notify_all()
+            #if not self._unfinished_tasks.acquire(False):
+            #    raise ValueError('task_done() called too many times')
+            queue_state = self._channel.queue_declare(queue=self._opid, passive = True)
+            a = queue_state.method.message_count
+            if a == 0:
+                self._channel.basic_publish(exchange='exchange-condition-'+self._opid,routing_key='condition-'+self._opid,body='notify')
 
         def join(self):
-            print('join')
-            with self._cond:
-                if self._unfinished_tasks.get_value() != 0:
-                    self._cond.wait()
+            def callback(ch, method, properties, body):
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+                self._channel.stop_consuming()
+            queue_state = self._channel.queue_declare(queue=self._opid, passive = True)
+            a =queue_state.method.message_count
+            if a != 0:
+                self._channel.basic_consume(queue='condition-'+self._opid, on_message_callback=callback)
+                self._channel.start_consuming()

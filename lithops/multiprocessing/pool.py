@@ -1,4 +1,4 @@
-#
+
 # Module providing the `Pool` class for managing a process pool
 #
 # multiprocessing/pool.py
@@ -256,6 +256,8 @@ class ApplyResult(object):
 
         if self._callback is not None:
             self._callback(self._value)
+
+        util.export_execution_details(self._futures, self._executor)
 
         return self._value
 

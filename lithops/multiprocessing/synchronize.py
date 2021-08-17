@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 SEM_VALUE_MAX = 2 ** 30
 
-if util. mp_config.get_parameter(mp_config.CACHE) == 'redis': 
+if util.mp_config.get_parameter(mp_config.CACHE) == 'redis' and '' ==  mp_config.get_parameter(mp_config.AMQP): 
     #
     # Base class for semaphores and mutexes
     #
@@ -315,7 +315,7 @@ if util. mp_config.get_parameter(mp_config.CACHE) == 'redis':
         def _count(self, value):
             self._client.set(self._count_handle, value, ex=mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
 
-elif util. mp_config.get_parameter(mp_config.CACHE) == 'memcached':
+elif util.mp_config.get_parameter(mp_config.CACHE) == 'memcached' and '' ==  mp_config.get_parameter(mp_config.AMQP):
 
     #
     # Base class for semaphores and mutexes
@@ -564,11 +564,10 @@ elif util. mp_config.get_parameter(mp_config.CACHE) == 'memcached':
                 if endtime is not None:
                     waittime = endtime - time.monotonic()
                     if waittime <= 0:
-                        #print('Timeout triggered something went wrong')
+                        print('Timeout triggered something went wrong')
                         self._client.incr(self._mutex+key,1)
                         break
             self._client.delete(self._mutex+key)
-            #print('acquire ' + str(time.time()))
             
 
         def _release(self, key):
@@ -718,9 +717,10 @@ elif util. mp_config.get_parameter(mp_config.CACHE) == 'memcached':
         def _count(self, value):
             self._client.set(self._count_handle, value)
 
-else: 
-    # Queue based manager
-
+elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
+    
+    import pika
+    
     #
     # Base class for semaphores and mutexes
     #
@@ -731,24 +731,33 @@ else:
         # return new semlock value
         # only increments its value if
         # it is not above the max value
+        
 
         def __init__(self, value=1, max_value=1):
             self._name = 'semlock-' + util.get_uuid()
             self._max_value = max_value
-            self._queue = queues.Queue()
+            self._parameters = util.get_amqp_client()
             logger.debug('Requested creation of resource Lock %s', self._name)
+
+            self._connection = pika.BlockingConnection(self._parameters)
+            self._channel = self._connection.channel()
+            if self._max_value > 0:
+                args = {"x-max-length":max_value}
+            else:
+                args = {}
+            self._channel.queue_declare(queue=self._name, arguments =args)
             if value != 0:
-                n = 0
-                while n !=value:
-                    self._queue.put(0)
-                    n+=1
+                for i in range(value):
+                    self._channel.basic_publish(exchange = '', routing_key=self._name,body='')
             #self._ref = util.RemoteReference(self._name, client=self._client)
 
         def __getstate__(self):
-            return (self._name, self._max_value, self._queue)#, self._ref)
+            return (self._name, self._max_value, self._parameters)
 
         def __setstate__(self, state):
-            (self._name, self._max_value, self._queue) = state#,  self._ref) = state
+            (self._name, self._max_value, self._parameters) = state
+            self._connection = pika.BlockingConnection(self._parameters)
+            self._channel = self._connection.channel()
 
         def __enter__(self):
             self.acquire()
@@ -758,24 +767,31 @@ else:
             self.release()
 
         def get_value(self):
-            value = self._queue.qsize()
-            return int(value)
+            queue_state = self._channel.queue_declare(queue=self._name, passive = True)
+            return queue_state.method.message_count
 
         def acquire(self, block=True):
             if block:
                 logger.debug('Requested blocking acquire for lock %s', self._name)
-                self._queue.get(block)
+                def callback(ch, method, properties, body):
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    ch.stop_consuming()
+                #self._channel.basic_qos(prefetch_count=1)
+                self._channel.basic_consume(queue=self._name, on_message_callback=callback)
+                self._channel.start_consuming()
                 return True
             else:
                 logger.debug('Requested non-blocking acquire for lock %s', self._name)
-                return self._queue.get()
+                method, properties, body  = self._channel.basic_get(queue=self._opid, auto_ack=True)
+                return body is not None
 
-        def release(self, n=1):
+        def release(self):
             logger.debug('Requested release for lock %s', self._name)
-            c = 0
-            while c !=n:
-                self._queue.put(0)
-                c+=1
+            current_value = self.get_value()
+            if current_value >= self._max_value:
+                return current_value
+            self._channel.basic_publish(exchange = '', routing_key=self._name,body='')
+            return current_value + 1
 
         def __repr__(self):
             try:
@@ -792,6 +808,7 @@ else:
     class Semaphore(SemLock):
         def __init__(self, value=1):
             super().__init__(value, SEM_VALUE_MAX)
+
 
     #
     # Bounded semaphore
@@ -842,19 +859,26 @@ else:
         def __init__(self, lock=None):
             if lock:
                 self._lock = lock
-                #self._client = util.get_redis_client()
-                self._queue = queues.Queue()
-                self._queue_wait = queues.Queue()
+                self._parameters = util.get_amqp_client()
             else:
                 self._lock = Lock()
                 # help reducing the amount of open clients
-                #self._client = self._lock._client
-                self._queue = queues.Queue()
-                self._queue_wait = queues.Queue()
+                self._parameters = self._lock._parameters
 
             self._notify_handle = 'condition-notify-' + util.get_uuid()
+            self._connection = pika.BlockingConnection(self._parameters)
+            self._channel = self._connection.channel()
+            self._channel.queue_declare(queue=self._notify_handle)
             logger.debug('Requested creation of resource Condition %s', self._notify_handle)
-            #self._ref = util.RemoteReference(self._notify_handle,client=self._client)
+            #self._ref = util.RemoteReference(self._notify_handle,client=self._parameters)
+
+        def __getstate__(self):
+            return (self._lock, self._parameters, self._notify_handle)
+
+        def __setstate__(self, state):
+            (self._lock, self._parameters, self._notify_handle) = state
+            self._connection = pika.BlockingConnection(self._parameters)
+            self._channel = self._connection.channel()
 
         def acquire(self):
             return self._lock.acquire()
@@ -873,24 +897,42 @@ else:
 
             # Enqueue the key we will be waiting for until we are notified
             wait_handle = 'condition-wait-' + util.get_uuid()
-            self._queue.put(wait_handle)
-
+            #res = self._client.rpush(self._notify_handle, wait_handle)
+            self._channel.basic_publish(exchange = '', routing_key=self._notify_handle,body=cloudpickle.dumps(wait_handle))
+            self._channel.queue_declare(queue=wait_handle)
             #if not res:
             #    raise Exception('Condition ({}) could not enqueue waiting key'.format(self._notify_handle))
 
             # Release lock, wait to get notified, acquire lock
             self.release()
             logger.debug('Waiting for token %s on condition %s', wait_handle, self._notify_handle)
-            self._queue_wait.get(block= True, timeout = timeout)
+            #self._poll(wait_handle,timeout)
+            if timeout == None:
+                consume_generator = self._channel.consume(queue=wait_handle)
+            else:
+                consume_generator = self._channel.consume(queue=wait_handle,inactivity_timeout=timeout)
+            for method, properties, body in consume_generator:
+                if (body == None and timeout != None) or body != None:
+                    break
             self.acquire()
+
+        def _poll(self, name, timeout):
+            max_time = time.monotonic() + timeout
+            while time.monotonic() < max_time:
+                queue_state = self._channel.queue_declare(queue=name, passive = True)
+                if queue_state.method.message_count > 0:
+                    self._channel.basic_get(queue=name)
+                    break
 
         def notify(self):
             assert self._lock.owned
 
             logger.debug('Notify condition %s', self._notify_handle)
-            wait_handle = self._queue.get()
+            method, properties, body  = self._channel.basic_get(queue=self._notify_handle, auto_ack  = True)
+            wait_handle = body
             if wait_handle is not None:
-                self._queue_wait.put(wait_handle)
+                self._channel.basic_publish(exchange = '', routing_key=wait_handle,body='notify')
+
                 #if not res:
                 #    raise Exception('Condition ({}) could not notify one waiting process'.format(self._notify_handle))
 
@@ -898,13 +940,19 @@ else:
             assert self._lock.owned
 
             logger.debug('Notify all for condition %s', self._notify_handle)
-            wait_handles = []
-            while not self._queue.empty():
-                wait_handles.append(self._queue.get())
 
+            queue_state = self._channel.queue_declare(queue=self._notify_handle, passive = True)
+            count = queue_state.method.message_count
+            wait_handles = []
+            
+            for i in range(count):
+                method, properties, body  = self._channel.basic_get(queue=self._notify_handle, auto_ack  = True)
+                wait_handles.append(cloudpickle.loads(body))
+                
             if len(wait_handles) > 0:
+
                 for handle in wait_handles:
-                    self._queue_wait.put(handle+msg)
+                    self._channel.basic_publish(exchange = '', routing_key=handle,body='notifyall')
 
                 #if not all(results):
                 #    raise Exception('Condition ({}) could not notify all waiting processes'.format(self._notify_handle))
@@ -935,30 +983,30 @@ else:
     class Event:
         def __init__(self):
             self._cond = Condition()
-            #self._client = self._cond._client
-            self._queue = queues.Queue()
+            self._client = self._cond._client
             self._flag_handle = 'event-flag-' + util.get_uuid()
             logger.debug('Requested creation of resource Event %s', self._flag_handle)
-            #self._ref = util.RemoteReference(self._flag_handle,client=self._client)
+            self._channel.queue_declare(queue=self._flag_handle, arguments = {"x-max-length":1})
+            self._ref = util.RemoteReference(self._flag_handle,
+                                            client=self._client)
 
         def is_set(self):
             logger.debug('Request event %s is set', self._flag_handle)
-            #return self._client.get(self._flag_handle) == b'1'
-            return not self._queue.empty()
-
+            method, properties, body  = self._channel.basic_get(queue=self._flag_handle, auto_ack=False)
+            return body == b'1'
 
         def set(self):
             with self._cond:
                 logger.debug('Request set event %s', self._flag_handle)
-                #self._client.set(self._flag_handle, '1')
-                self._queue.put(1)
+                self._channel.basic_get(queue=self._flag_handle, auto_ack=True)
+                channel.basic_publish(routing_key=self._flag_handle,body='1')
                 self._cond.notify_all()
 
         def clear(self):
             with self._cond:
                 logger.debug('Request clear event %s', self._flag_handle)
-                #self._client.set(self._flag_handle, '0')
-                self._queue.get()
+                self._channel.basic_get(queue=self._flag_handle, auto_ack=True)
+                channel.basic_publish(routing_key=self._flag_handle,body='0')
 
         def wait(self, timeout=None):
             with self._cond:
@@ -973,31 +1021,43 @@ else:
     class Barrier(threading.Barrier):
         def __init__(self, parties, action=None, timeout=None):
             self._cond = Condition()
-            #self._client = self._cond._client
-            self._queue_state = queues.Queue()
-            self._queue_count = queues.Queue()
+            self._channel = self._cond._channel
             uuid = util.get_uuid()
             self._state_handle = 'barrier-state-' + uuid
             self._count_handle = 'barrier-count-' + uuid
-            #self._ref = util.RemoteReference(referenced=[self._state_handle, self._count_handle],client=self._client)
+            self._channel.queue_declare(queue=self._state_handle, arguments = {"x-max-length":1})
+            self._channel.queue_declare(queue=self._count_handle, arguments = {"x-max-length":1})
+            #self._ref = util.RemoteReference(referenced=[self._state_handle, self._count_handle],
+            #                                client=self._client)
             self._action = action
             self._timeout = timeout
             self._parties = parties
             self._state = 0  # 0 = filling, 1 = draining, -1 = resetting, -2 = broken
             self._count = 0
 
+        def __getstate__(self):
+            return (self._lock, self._parameters, self._notify_handle)
+
+        def __setstate__(self, state):
+            (self._lock, self._parameters, self._notify_handle) = state
+            self._connection = pika.BlockingConnection(self._parameters)
+            self._channel = self._connection.channel()
         @property
         def _state(self):
-            return int(self._queue_state.get())
+            _,_, body = self._channel.basic_get(queue=self._state_handle, auto_ack=True)
+            return int(body)
 
         @_state.setter
         def _state(self, value):
-            self._queue_state.put(value)
+            self._channel.basic_get(queue=self._state_handle, auto_ack=True)
+            self._channel.basic_publish(exchange = '', routing_key=self._state_handle,body=str(value))
 
         @property
         def _count(self):
-            return int(self._queue_count.get())
+            _,_, body = self._channel.basic_get(queue=self._count_handle, auto_ack=True)
+            return int(body)
 
         @_count.setter
         def _count(self, value):
-            self._queue_count.put(value)
+            self._channel.basic_get(queue=self._count_handle, auto_ack=True)
+            self._channel.basic_publish(exchange = '', routing_key=self._count_handle,body=str(value))
