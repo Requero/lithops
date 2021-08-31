@@ -298,7 +298,7 @@ class _ConnectionBase:
         self.close()
 
 
-if 'redis' in  mp_config.get_parameter(mp_config.CACHE) and util.mp_config.get_parameter(mp_config.AMQP) == '':
+if 'redis' in  mp_config.get_parameter(mp_config.CACHE) and mp_config.get_parameter(mp_config.AMQP) == '':
 
    
     class _RedisConnection(_ConnectionBase):
@@ -400,35 +400,34 @@ if 'redis' in  mp_config.get_parameter(mp_config.CACHE) and util.mp_config.get_p
         """
         Connection class for PyNNG
         """
-        _buff = Queue()
+
         def __init__(self, handle, readable=True, writable=True):
             logger.debug('Requested creation of Nanomsg connection resource')
             super().__init__(handle, readable, writable)
-            #self._client = util.get_redis_client()
             self._client = util.get_cache_client()
-            #self._buff = Queue()
             self._subhandle = get_subhandle(handle)
+            self._subhandle_addr = None
             self._connect()
 
         def _connect(self):
-            
+            self._buff = Queue()
             self._rep = pynng.Rep0()
 
             bind = False
+            addr = None
             while not bind:
                 try:
-                    addr = 'tcp://' + get_network_ip() + ':' + str(random.randrange(MIN_PORT, MAX_PORT))
+                    addr = 'tcp://' + util.get_network_ip() + ':' + str(random.randrange(MIN_PORT, MAX_PORT))
                     self._rep.listen(addr)
                     logger.debug('Assigned server address is %s', addr)
                     bind = True
                 except pynng.exceptions.AddressInUse:
                     pass
-
             self._listener = threading.Thread(target=self._listen)
             self._listener.daemon = True
             self._listener.start()
 
-            self._req = pynng.Req0()
+            self._req = None
 
             logger.debug('Set server address %s as handle %s', addr, self._handle)
             self._client.set(self._handle, bytes(addr, 'utf-8'), ex=mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
@@ -438,7 +437,7 @@ if 'redis' in  mp_config.get_parameter(mp_config.CACHE) and util.mp_config.get_p
             while True:
                 try:
                     msg = self._rep.recv()
-                    logger.debug('Message received of size %i B', len(msg))
+                    # logger.debug('Message received of size %i B', len(msg))
                 except pynng.exceptions.Closed:
                     break
                 self._buff.put(msg)
@@ -478,27 +477,27 @@ if 'redis' in  mp_config.get_parameter(mp_config.CACHE) and util.mp_config.get_p
         def _send_bytes(self, buf):
             if self._req is None:
                 self._req = pynng.Req0()
-
-            logger.debug('Get address from directory for handle %s', self._subhandle)
-            addr = self._client.get(self._subhandle)
-
-            retry = 15
-            retry_sleep = 1
-            while addr is None:
-                time.sleep(retry_sleep)
-                retry_sleep += 0.5
+                logger.debug('Get address from directory for handle %s', self._subhandle)
                 addr = self._client.get(self._subhandle)
-                retry -= 1
-                if retry == 0:
-                    raise Exception('Server address could not be fetched for handle {}'.format(self._subhandle))
+                
+                retry = 15
+                retry_sleep = 1
+                while addr is None:
+                    time.sleep(retry_sleep)
+                    retry_sleep += 0.5
+                    addr = self._client.get(self._subhandle)
+                    retry -= 1
+                    if retry == 0:
+                        raise Exception('Server address could not be fetched for handle {}'.format(self._subhandle))
 
-            addr = addr.decode('utf-8')
-            logger.debug('Dialing %s', addr)
-            self._req.dial(addr)
-            logger.debug('Send %i B to %s', len(buf), addr)
-            self._req.send(buf.obj)
+                self._subhandle_addr = addr.decode('utf-8')
+                logger.debug('Dialing %s', self._subhandle_addr)
+                self._req.dial(self._subhandle_addr)
+
+            # logger.debug('Send %i B to %s', len(buf), self._subhandle_addr)
+            self._req.send(buf)
             res = self._req.recv()
-            logger.debug(res)
+            # logger.debug(res)
 
         def _recv_bytes(self, maxsize=None):
             chunk = self._buff.get()
@@ -676,9 +675,11 @@ elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE) and util.mp_config
                 bind = False
                 while not bind:
                     try:
-                        addr = 'tcp://' + get_network_ip() + ':' + str(random.randrange(MIN_PORT, MAX_PORT))
-                        self._sub.subscribe("")
-                        self._sub.dial(addr)
+                        addr = 'tcp://' + util.get_network_ip() + ':' + str(random.randrange(MIN_PORT, MAX_PORT))
+                        
+                        self._sub.listen(addr)
+                        self._sub.subscribe(b'')
+                        
                         logger.debug('Assigned server address is %s', addr)
                         bind = True
                     except pynng.exceptions.AddressInUse:
@@ -715,7 +716,7 @@ elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE) and util.mp_config
                         break
                     self._buff.put(msg)
                     self._client.incr(self._subhandle+'len',1)
-                    self._sub.send(b'ok')
+                    #self._sub.send(b'ok')
             logger.debug('Server thread finished')
 
         def __getstate__(self):
@@ -746,7 +747,7 @@ elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE) and util.mp_config
             else:
                 self._sub.close()
                 self._client.delete(self._handle)
-                if self._pub:
+                if self._pub != None:
                     self._pub.close()
                 if hasattr(self._client, 'close'):
                     self._client.close()
@@ -788,7 +789,6 @@ elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE) and util.mp_config
 
                 logger.debug('Get address from directory for handle %s', self._subhandle)
                 addr = self._client.get(self._subhandle)
-
                 retry = 15
                 retry_sleep = 1
                 while addr is None:
@@ -804,7 +804,6 @@ elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE) and util.mp_config
                 logger.debug('Send %i B to %s', len(buf), addr)
                 self._pub.send(buf)
                 #res = self._pub.recv()
-                #print(res)
                 #logger.debug(res)
 
         def _recv_bytes(self, maxsize=None):
@@ -1047,9 +1046,9 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP) :
                 self._parameters = self._parameters
                 self._connection = pika.BlockingConnection(self._parameters)
                 self._channel = self._connection.channel()
-                self._channel.exchange_declare(exchange='exchange-'+self._subhandle, exchange_type='fanout')
-                self._channel.queue_declare(queue=self._subhandle)
-                self._channel.queue_bind(exchange='exchange-'+self._subhandle, queue=self._subhandle)
+                self._channel.exchange_declare(exchange='exchange-'+self._handle, exchange_type='fanout')
+                self._channel.queue_declare(queue=self._handle, arguments = {"x-message-ttl": 900000})
+                self._channel.queue_bind(exchange='exchange-'+self._handle, queue=self._handle)
                 self._read = self._channelread
                 self._write = self._channelwrite
                 self._pubsub = True
@@ -1066,7 +1065,7 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP) :
             self._connect()
 
         def __len__(self):
-            queue_state = self._channel.queue_declare(queue=self._subhandle, passive = True)
+            queue_state = self._channel.queue_declare(queue=self._handle, passive = True)
             return queue_state.method.message_count
 
         def _set_expiry(self, key):
@@ -1089,7 +1088,7 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP) :
                 res = body
                 ch.basic_ack(delivery_tag=method.delivery_tag)
                 ch.stop_consuming()
-            #self._channel.basic_qos(prefetch_count=1)
+            self._channel.basic_qos(prefetch_count=1)
             self._channel.basic_consume(queue=handle, on_message_callback=callback)
             self._channel.start_consuming()
             return res
@@ -1127,6 +1126,8 @@ class Listener(object):
         conn_type = mp_config.get_parameter(mp_config.PIPE_CONNECTION_TYPE)
         if conn_type == REDIS_LIST_CONN:
             self._listener = _RedisListener(address, family, backlog)
+        elif conn_type == RABBITMQ_PUBSUB_CONN:
+            self._listener = _RabbitMQListener(address, family, backlog)
         else:
             raise Exception('Unknown connection type {}'.format(conn_type))
 
@@ -1172,6 +1173,8 @@ def Client(address, family=None, authkey=None):
     conn_type = mp_config.get_parameter(mp_config.PIPE_CONNECTION_TYPE)
     if conn_type == REDIS_LIST_CONN:
         return _RedisClient(address)
+    elif conn_type == RABBITMQ_PUBSUB_CONN:
+        return _RabbitMQClient(address)
     else:
         raise Exception('Unknown connection type {}'.format(conn_type))
 
@@ -1214,7 +1217,6 @@ class _RedisListener:
     def __init__(self, address, family=None, backlog=1):
         logger.debug('Requested creation of Redis listener for address %s', address)
         self._address = address
-        #self._client = util.get_redis_client()
         self._client = util.get_cache_client()
         self._connect()
 
@@ -1264,6 +1266,76 @@ class _RedisListener:
                 unlink()
 
 
+class _RabbitMQListener:
+    def __init__(self, address, family=None, backlog=1):
+        logger.debug('Requested creation of RabbitMQ listener for address %s', address)
+        self._address = address
+        self._client = util.get_amqp_client()
+        self._connect()
+
+        self._last_accepted = None
+        self._unlink = None
+
+    def _connect(self):
+        self._parameters = self._client
+        ip, port = self._address
+        chan = '{}:{}'.format(ip, port)
+        logger.debug('Subscribe to topic %s', chan)
+        self._connection = pika.BlockingConnection(self._parameters)
+        self._channel = self._connection.channel()
+        self._channel.exchange_declare(exchange='exchange-'+chan, exchange_type='fanout')
+        self._channel.queue_declare(queue=chan, arguments = {"x-message-ttl": 900000})
+        self._channel.queue_bind(exchange='exchange-'+chan, queue=chan)
+        #self._pubsub.subscribe(chan)
+        #self._gen = self._pubsub.listen()
+        # ignore first message (subscribe message)
+        #next(self._gen)
+
+    def __getstate__(self):
+        return (self._address, self._family, self._client,
+                self._last_accepted, self._unlink)
+
+    def __setstate__(self, state):
+        (self._address, self._family, self._client,
+         self._last_accepted, self._unlink) = state
+        self._connect()
+
+    def accept(self):
+        ip, port = self._address
+        chan = '{}:{}'.format(ip, port)
+        global msg
+        res = None
+        def callback(ch, method, properties, body):
+            global msg
+            msg = body
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            ch.stop_consuming()
+        self._channel.basic_qos(prefetch_count=1)
+        self._channel.basic_consume(queue=chan, on_message_callback=callback)
+        self._channel.start_consuming()
+        logger.debug('Received event: %s', msg)
+        client_subhandle = msg.decode('utf-8')
+        c = _RabbitmqConnection(client_subhandle)
+        c.send('OK')
+        self._last_accepted = client_subhandle
+        return c
+
+    def close(self):
+        try:
+            self._connection.close()
+            self._parameters = None
+            self._gen = None
+            if hasattr(self._client, 'close'):
+                self._connection.close()
+                self._client = None
+        finally:
+            unlink = self._unlink
+            if unlink is not None:
+                self._unlink = None
+                unlink()
+
+
+
 def _RedisClient(address):
     """
     Return a connection object connected to the socket given by `address`
@@ -1279,6 +1351,23 @@ def _RedisClient(address):
     assert ack == 'OK'
     return c
 
+
+def _RabbitMQClient(address):
+    """
+    Return a connection object connected to the socket given by `address`
+    """
+    h1, h2 = get_handle_pair(conn_type=RABBITMQ_PUBSUB_CONN)
+    c = _RabbitmqConnection(h1)
+    rabbitmq_client = util.get_amqp_client()
+    ip, port = address
+    chan = '{}:{}'.format(ip, port)
+    _connection = pika.BlockingConnection(rabbitmq_client)
+    _channel = _connection.channel()
+    _channel.queue_declare(queue=h1, arguments = {"x-message-ttl": 900000})
+    _channel.basic_publish(exchange='exchange-'+chan,routing_key=chan,body=bytes(h2, 'utf-8'))
+    ack = c.recv()
+    assert ack == 'OK'
+    return c
 #
 # Wait
 #

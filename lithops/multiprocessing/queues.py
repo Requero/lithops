@@ -420,16 +420,16 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
         Full = Full
 
         def __init__(self, maxsize=0):
-            self._opid = 'queue'+str(os.getpid())
+            self._opid = 'queue-'+str(os.getpid())+'-'+util.get_uuid()
             self._parameters = util.get_amqp_client()
             self._closed = False
             self._maxsize = maxsize
             self._connection = pika.BlockingConnection(self._parameters)
             self._channel = self._connection.channel()
             if self._maxsize > 0:
-                args = {"x-max-length":maxsize}
+                args = {"x-max-length":maxsize, "x-message-ttl": 900000}
             else:
-                args = {}
+                args = {"x-message-ttl": 900000}
             self._channel.queue_declare(queue=self._opid,arguments =args)
             self._after_fork()
 
@@ -463,7 +463,7 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
                 
             if self._notfull:
                 obj = cloudpickle.dumps(obj)
-                self._channel.basic_publish(routing_key=self._opid,body=obj)
+                self._channel.basic_publish(exchange='', routing_key=self._opid,body=obj)
 
 
         def get(self, block=True, timeout=None):
@@ -473,10 +473,10 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
                 res = None
                 def callback(ch, method, properties, body):
                     global res
-                    ch.stop_consuming()
                     ch.basic_ack(delivery_tag=method.delivery_tag)
                     res = body
-                #self._channel.basic_qos(prefetch_count=1)
+                    ch.stop_consuming()
+                self._channel.basic_qos(prefetch_count=1)
                 self._channel.basic_consume(queue=self._opid, on_message_callback=callback)
                 self._channel.start_consuming()
                 return cloudpickle.loads(res)
@@ -540,12 +540,12 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
 
     class SimpleQueue:
         def __init__(self):
-            self._opid = 'simplequeue'+str(os.getpid())
+            self._opid = 'simplequeue-'+str(os.getpid())+'-'+util.get_uuid()
             self._parameters = util.get_amqp_client()
             self._closed = False
             self._connection = pika.BlockingConnection(self._parameters)
             self._channel = self._connection.channel()
-            self._channel.queue_declare(queue=self._opid)
+            self._channel.queue_declare(queue=self._opid, arguments = {"x-message-ttl": 900000})
             self._after_fork()
 
         def __getstate__(self):
@@ -579,12 +579,13 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
                 res = None
                 def callback(ch, method, properties, body):
                     global res
-                    res = body
                     ch.basic_ack(delivery_tag=method.delivery_tag)
+                    res = body
                     ch.stop_consuming()
-                #self._channel.basic_qos(prefetch_count=1)
+                self._channel.basic_qos(prefetch_count=1)
                 self._channel.basic_consume(queue=self._opid, on_message_callback=callback)
                 self._channel.start_consuming()
+                return cloudpickle.loads(res)
             else:
                 res = None
                 if block:
@@ -594,7 +595,7 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
                     raise Empty
                 method, properties, body  = self._channel.basic_get(queue=self._opid, auto_ack=False)
                 res = body
-            return cloudpickle.loads(res)
+                return cloudpickle.loads(res)
 
         def qsize(self):
             queue_state = self._channel.queue_declare(queue=self._opid, passive = True)
@@ -644,8 +645,6 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
 
         def _afterfork(self):
             super()._afterfork()
-            #self._channel.exchange_declare(exchange=self._opid+'exchangecondition', exchange_type='fanout')
-            #self._channel.queue_declare(queue=self._opid+'condition')
 
         def __getstate__(self):
             return (self._maxsize, self._parameters, self._opid)
@@ -658,8 +657,8 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
             #if not self._unfinished_tasks.acquire(False):
             #    raise ValueError('task_done() called too many times')
             queue_state = self._channel.queue_declare(queue=self._opid, passive = True)
-            a = queue_state.method.message_count
-            if a == 0:
+            c = queue_state.method.message_count
+            if c == 0:
                 self._channel.basic_publish(exchange='exchange-condition-'+self._opid,routing_key='condition-'+self._opid,body='notify')
 
         def join(self):
@@ -667,7 +666,7 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
                 ch.basic_ack(delivery_tag=method.delivery_tag)
                 self._channel.stop_consuming()
             queue_state = self._channel.queue_declare(queue=self._opid, passive = True)
-            a =queue_state.method.message_count
-            if a != 0:
+            c = queue_state.method.message_count
+            if c != 0:
                 self._channel.basic_consume(queue='condition-'+self._opid, on_message_callback=callback)
                 self._channel.start_consuming()

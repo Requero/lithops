@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 SEM_VALUE_MAX = 2 ** 30
 
-if util.mp_config.get_parameter(mp_config.CACHE) == 'redis' and '' ==  mp_config.get_parameter(mp_config.AMQP): 
+if mp_config.get_parameter(mp_config.CACHE) == 'redis' and '' ==  mp_config.get_parameter(mp_config.AMQP): 
     #
     # Base class for semaphores and mutexes
     #
@@ -160,7 +160,7 @@ if util.mp_config.get_parameter(mp_config.CACHE) == 'redis' and '' ==  mp_config
                 self._lock = lock
                 self._client = util.get_cache_client()
             else:
-                self._lock = Lock()
+                self._lock = RLock()
                 # help reducing the amount of open clients
                 self._client = self._lock._client
 
@@ -315,7 +315,7 @@ if util.mp_config.get_parameter(mp_config.CACHE) == 'redis' and '' ==  mp_config
         def _count(self, value):
             self._client.set(self._count_handle, value, ex=mp_config.get_parameter(mp_config.CACHE_EXPIRY_TIME))
 
-elif util.mp_config.get_parameter(mp_config.CACHE) == 'memcached' and '' ==  mp_config.get_parameter(mp_config.AMQP):
+elif mp_config.get_parameter(mp_config.CACHE) == 'memcached' and '' ==  mp_config.get_parameter(mp_config.AMQP):
 
     #
     # Base class for semaphores and mutexes
@@ -527,7 +527,7 @@ elif util.mp_config.get_parameter(mp_config.CACHE) == 'memcached' and '' ==  mp_
                 #self._client = util.get_redis_client()
                 self._client = util.get_cache_client()
             else:
-                self._lock = Lock()
+                self._lock = RLock()
                 # help reducing the amount of open clients
                 self._client = self._lock._client
 
@@ -717,7 +717,7 @@ elif util.mp_config.get_parameter(mp_config.CACHE) == 'memcached' and '' ==  mp_
         def _count(self, value):
             self._client.set(self._count_handle, value)
 
-elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
+elif mp_config.get_parameter(mp_config.AMQP) == 'rabbitmq':
     
     import pika
     
@@ -736,7 +736,7 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
 
             self._connection = pika.BlockingConnection(self._parameters)
             self._channel = self._connection.channel()
-            self._channel.queue_declare(queue=self._name)
+            self._channel.queue_declare(queue=self._name,arguments = {"x-message-ttl": 900000})
             if value != 0:
                 for i in range(value):
                     msg = 'value-'+str(time.time())
@@ -854,14 +854,14 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
                 self._lock = lock
                 self._parameters = util.get_amqp_client()
             else:
-                self._lock = Lock()
+                self._lock = RLock()
                 # help reducing the amount of open clients
                 self._parameters = self._lock._parameters
 
             self._notify_handle = 'condition-notify-' + util.get_uuid()
             self._connection = pika.BlockingConnection(self._parameters)
             self._channel = self._connection.channel()
-            self._channel.queue_declare(queue=self._notify_handle)
+            self._channel.queue_declare(queue=self._notify_handle, arguments = {"x-message-ttl": 900000})
             logger.debug('Requested creation of resource Condition %s', self._notify_handle)
             #self._ref = util.RemoteReference(self._notify_handle,client=self._parameters)
 
@@ -871,7 +871,7 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
         def __setstate__(self, state):
             (self._lock, self._parameters, self._notify_handle) = state
             self._connection = pika.BlockingConnection(self._parameters)
-            self._channel = self._connection.channel()
+            #self._channel = self._connection.channel()
 
         def acquire(self):
             return self._lock.acquire()
@@ -887,12 +887,12 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
 
         def wait(self, timeout=None):
             assert self._lock.owned
-
+            self._channel = self._connection.channel()
             # Enqueue the key we will be waiting for until we are notified
             wait_handle = 'condition-wait-' + util.get_uuid()
             #res = self._client.rpush(self._notify_handle, wait_handle)
-            self._channel.basic_publish(exchange = '', routing_key=self._notify_handle,body=cloudpickle.dumps(wait_handle))
-            self._channel.queue_declare(queue=wait_handle)
+            self._channel.basic_publish(exchange = '', routing_key=self._notify_handle,body=wait_handle)
+            self._channel.queue_declare(queue=wait_handle, arguments = {"x-message-ttl": 900000})
             #if not res:
             #    raise Exception('Condition ({}) could not enqueue waiting key'.format(self._notify_handle))
 
@@ -905,8 +905,10 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
             else:
                 consume_generator = self._channel.consume(queue=wait_handle,inactivity_timeout=timeout)
             for method, properties, body in consume_generator:
+                self._channel.basic_ack(method.delivery_tag)
                 if (body == None and timeout != None) or body != None:
                     break
+            self._channel.cancel()
             self.acquire()
 
         def _poll(self, name, timeout):
@@ -919,11 +921,12 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
 
         def notify(self):
             assert self._lock.owned
-
+            self._channel = self._connection.channel()
             logger.debug('Notify condition %s', self._notify_handle)
             method, properties, body  = self._channel.basic_get(queue=self._notify_handle, auto_ack  = True)
-            wait_handle = body
-            if wait_handle is not None:
+            
+            if body is not None:
+                wait_handle = body.decode('utf-8')
                 self._channel.basic_publish(exchange = '', routing_key=wait_handle,body='notify')
 
                 #if not res:
@@ -931,7 +934,7 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
 
         def notify_all(self, msg=''):
             assert self._lock.owned
-
+            self._channel = self._connection.channel()
             logger.debug('Notify all for condition %s', self._notify_handle)
 
             queue_state = self._channel.queue_declare(queue=self._notify_handle, passive = True)
@@ -940,7 +943,7 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
             
             for i in range(count):
                 method, properties, body  = self._channel.basic_get(queue=self._notify_handle, auto_ack  = True)
-                wait_handles.append(cloudpickle.loads(body))
+                wait_handles.append(body.decode('utf-8'))
                 
             if len(wait_handles) > 0:
 
@@ -976,31 +979,42 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
     class Event:
         def __init__(self):
             self._cond = Condition()
-            self._client = self._cond._client
+            self._parameters = self._cond._parameters
+            self._connection = pika.BlockingConnection(self._parameters)
+            self._channel = self._connection.channel()
             self._flag_handle = 'event-flag-' + util.get_uuid()
             logger.debug('Requested creation of resource Event %s', self._flag_handle)
             self._channel.queue_declare(queue=self._flag_handle, arguments = {"x-max-length":1})
-            self._ref = util.RemoteReference(self._flag_handle,
-                                            client=self._client)
+            #self._ref = util.RemoteReference(self._flag_handle,client=self._client)
+
+
+        def __getstate__(self):
+            return (self._cond, self._parameters, self._flag_handle)
+
+        def __setstate__(self, state):
+            (self._cond, self._parameters, self._flag_handle) = state
+            self._connection = pika.BlockingConnection(self._parameters)
+            self._channel = self._connection.channel()
 
         def is_set(self):
             logger.debug('Request event %s is set', self._flag_handle)
             method, properties, body  = self._channel.basic_get(queue=self._flag_handle, auto_ack=True)
-            channel.basic_publish(routing_key=self._flag_handle,body=body)
+            if body != None:
+                self._channel.basic_publish(exchange = '', routing_key=self._flag_handle,body=body)
             return body == b'1'
 
         def set(self):
             with self._cond:
                 logger.debug('Request set event %s', self._flag_handle)
                 self._channel.basic_get(queue=self._flag_handle, auto_ack=True)
-                channel.basic_publish(routing_key=self._flag_handle,body='1')
+                self._channel.basic_publish(exchange = '', routing_key=self._flag_handle,body='1')
                 self._cond.notify_all()
 
         def clear(self):
             with self._cond:
                 logger.debug('Request clear event %s', self._flag_handle)
                 self._channel.basic_get(queue=self._flag_handle, auto_ack=True)
-                channel.basic_publish(routing_key=self._flag_handle,body='0')
+                self._channel.basic_publish(routing_key=self._flag_handle,body='0')
 
         def wait(self, timeout=None):
             with self._cond:
@@ -1011,7 +1025,9 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
     #
     # Barrier
     #
-
+    # exception raised by the Barrier class
+    class BrokenBarrierError(RuntimeError):
+        pass
     class Barrier:
         def __init__(self, parties, action=None, timeout=None):
             self._parameters = util.get_amqp_client()
@@ -1020,17 +1036,11 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
             uuid = util.get_uuid()
             self._state_handle = 'barrier-state-' + uuid
             self._count_handle = 'barrier-count-' + uuid
-            self._channel.queue_declare(queue=self._state_handle, arguments = {"x-max-length":1}, durable = True)
-            self._channel.queue_declare(queue=self._count_handle, arguments = {"x-max-length":1}, durable = True)
+            self._channel.queue_declare(queue=self._state_handle, arguments = {"x-max-length":1})
+            self._channel.queue_declare(queue=self._count_handle, arguments = {"x-max-length":1})
 
-            self._channel.basic_publish(exchange = '', routing_key=self._state_handle,body=str(0),
-                properties=pika.BasicProperties(
-                delivery_mode=2,  # make message persistent
-                ))
-            self._channel.basic_publish(exchange = '', routing_key=self._count_handle,body=str(0),
-                properties=pika.BasicProperties(
-                delivery_mode=2,  # make message persistent
-            ))
+            self._channel.basic_publish(exchange = '', routing_key=self._state_handle,body=str(0))
+            self._channel.basic_publish(exchange = '', routing_key=self._count_handle,body=str(0))
 
             self._cond = Condition()
             self._action = action
@@ -1180,20 +1190,20 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP):
 
         def _get_state(self):
             method, properties, body  = self._channel.basic_get(queue=self._state_handle, auto_ack=True)
-            self._channel.basic_publish(exchange = '', routing_key=self._state_handle, body=body)
+            if body != None:
+                self._channel.basic_publish(exchange = '', routing_key=self._state_handle, body=body)
             return int(body)
 
         def _set_state(self, value):
-            print(value)
             self._channel.basic_get(queue=self._state_handle, auto_ack=True)
             self._channel.basic_publish(exchange = '', routing_key=self._state_handle,body=str(value))
 
         def _get_count(self):
             method, properties, body  = self._channel.basic_get(queue=self._count_handle, auto_ack=True)
-            self._channel.basic_publish(exchange = '', routing_key=self._count_handle, body=body)
+            if body != None:
+                self._channel.basic_publish(exchange = '', routing_key=self._count_handle, body=body)
             return int(body)
 
         def _set_count(self, value):
-            print(value)
             self._channel.basic_get(queue=self._count_handle, auto_ack=True)
             self._channel.basic_publish(exchange = '', routing_key=self._count_handle,body=str(value))

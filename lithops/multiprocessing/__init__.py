@@ -12,6 +12,7 @@ from .context import (CloudContext, cpu_count, get_context,
 from .context import CloudContext as DefaultContext
 from .connection import Pipe
 from .managers import SyncManager as Manager
+from .managers import SyncManager
 from .pool import Pool
 from .process import CloudProcess as Process
 from .queues import Queue, SimpleQueue, JoinableQueue

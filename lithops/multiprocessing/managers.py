@@ -18,6 +18,7 @@
 import inspect
 import cloudpickle
 import logging
+import json
 
 from . import pool
 from . import synchronize
@@ -51,23 +52,25 @@ _builtin_types = {
 # Helper functions
 #
 
-def deslice(slic: slice):
-    start = slic.start
-    end = slic.stop
-    step = slic.step
 
-    if start is None:
-        start = 0
-    if end is None:
-        end = -1
-    elif start == end or end == 0:
-        return None, None, None
-    else:
-        end -= 1
-
-    return start, end, step
 
 if 'redis'in util. mp_config.get_parameter(mp_config.CACHE): 
+    def deslice(slic: slice):
+        start = slic.start
+        end = slic.stop
+        step = slic.step
+
+        if start is None:
+            start = 0
+        if end is None:
+            end = -1
+        elif start == end or end == 0:
+            return None, None, None
+        else:
+            end -= 0
+
+        return start, end, step
+    import redis
     #
     # Definition of BaseManager
     #
@@ -335,7 +338,7 @@ if 'redis'in util. mp_config.get_parameter(mp_config.CACHE):
                     return
 
                 if end < 0:
-                    end = len(self) + end
+                    end = len(self) + end +1
 
                 pipeline = self._client.pipeline(transaction=False)
                 try:
@@ -733,6 +736,19 @@ if 'redis'in util. mp_config.get_parameter(mp_config.CACHE):
     SyncManager.register('Pool', pool.Pool, can_manage=False)
 
 elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
+    def deslice(slic: slice):
+        start = slic.start
+        end = slic.stop
+        step = slic.step
+
+        if start is None:
+            start = 0
+        if end is None:
+            end = -1
+        elif start == end or end == 0:
+            return None, None, None
+        
+        return start, end, step
     #
     # Definition of BaseManager
     #
@@ -972,15 +988,16 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
                 if start is None:
                     return
 
-                if end < 0:
-                    end = len(self) + end
-
                 try:
                     iterable = iter(obj)
                     current = self._pickler.loads(self._client.get(self._oid))
+                    if end < 0:
+                        end = len(current) + end +1
+
                     for j in range(start, end):
                         obj = next(iterable)
                         current[j]=obj
+
                     self._client.set(self._oid, self._pickler.dumps(current))
                 except StopIteration:
                     pass
@@ -1003,7 +1020,10 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
                 if start is None:
                     return []
                 serialized = self._pickler.loads(self._client.get(self._oid))
+                if end < 0:
+                    end = len(serialized) + end +1
                 return serialized[start:end]
+                
             else:
                 raise TypeError('list indices must be integers '
                                 'or slices, not {}'.format(type(i)))
@@ -1116,8 +1136,8 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
             current.insert(index, obj)
             self._client.set(self._oid, self._pickler.dumps(current))
 
-
-    class DictProxy(BaseProxy):
+    #old
+    class DictProxy1(BaseProxy):
 
         def __init__(self, *args, **kwargs):
             super().__init__('dict')
@@ -1218,6 +1238,120 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
         def todict(self):
             return self._pickler.loads(self._client.get(self._oid))
 
+    
+    class DictProxy(BaseProxy):
+
+        def __init__(self, **kwargs):
+            super().__init__('dict')
+            temp = dict(**kwargs)
+            keys = ''
+            for k,v in temp.items():
+                keys = keys+','+self._uuid+json.dumps(k)
+                self._client.set(self._uuid+json.dumps(k), self._pickler.dumps(v))
+
+            self._client.set(self._uuid+'keys', keys)
+
+        def __setitem__(self, k, v):
+            self._client.set(self._uuid+json.dumps(k), self._pickler.dumps(v))
+            keys = self._client.get(self._uuid+'keys')
+            keys = keys.decode('utf-8')
+            if json.dumps(k) not in keys:
+                self._client.append(self._uuid+'keys', ','+self._uuid+json.dumps(k))
+
+        def __getitem__(self, k):
+            r = self._client.get(self._uuid+json.dumps(k))
+            if r is None:
+                return r
+            return self._pickler.loads(r)
+
+        def __delitem__(self, k):
+            keys = self._client.get(self._uuid+'keys')
+            keys = keys.decode('utf-8').replace(','+self._uuid+json.dumps(k),'')
+            self._client.set(self._uuid+'keys', keys)
+            self._client.delete(self._uuid+json.dumps(k))
+            #if res == 0:
+            #    raise KeyError(k)
+
+        def __contains__(self, k):
+            keys = self._client.get(self._uuid+'keys')
+            #keys = keys.decode('utf-8').split(',')
+            #temp = self._client.get_many(self._oid)
+            return json.dumps(k) in keys.decode('utf-8')
+
+        def __len__(self):
+            return len(self._client.get(self._uuid+'keys').split(',')[1:])
+
+        def __iter__(self):
+            return iter(self.keys())
+
+        def get(self, k, default=None):
+            try:
+                v = self.__getitem__(k)
+            except KeyError:
+                return default
+            else:
+                return v
+
+        def pop(self, k, default=None):
+            try:
+                v = self.__getitem__(k)
+            except KeyError:
+                return default
+            else:
+                self.__delitem__(k)
+                return v
+
+        def popitem(self):
+            try:
+                key = self.keys()[0]
+                item = (key, self.__getitem__(key))
+                self.__delitem__(key)
+                return item
+            except IndexError:
+                raise KeyError('popitem(): dictionary is empty')
+
+        def setdefault(self, k, default=None):
+            res = self._client.get(self._uuid+json.dumps(k))
+            self._client.set(self._uuid+json.dumps(k), self._pickler.dumps(default))
+            return res
+
+        def update(self, kwargs):
+            temp = dict(**kwargs)
+            keys = self._client.get(self._uuid+'keys')
+            keys = keys.decode('utf-8')
+            for k,v in temp.items():
+                keys = keys+','+self._uuid+json.dumps(k)
+                self._client.set(self._uuid+json.dumps(k), self._pickler.dumps(v))
+            self._client.set(self._uuid+'keys', keys)
+
+        def keys(self):
+            ks = self._client.get(self._uuid+'keys').decode('utf-8').replace(self._uuid,'').split(',')[1:]
+            return [json.loads(k) for k in ks]
+
+        def values(self):
+            keys = self._client.get(self._uuid+'keys')
+            keys = keys.decode('utf-8').split(',')[1:]
+            temp = self._client.get_many(keys)
+            return [self._pickler.loads(v) for v in temp.values()]
+
+        def items(self):
+            keys = self._client.get(self._uuid+'keys')
+            keys = keys.decode('utf-8').split(',')[1:]
+            temp = self._client.get_many(keys)
+            return [(k,self._pickler.loads(v)) for k,v in temp.items()]
+
+        def clear(self):
+            keys = self._client.get(self._uuid+'keys')
+            keys = keys.decode('utf-8').split(',')[1:]
+            for k in keys:
+                self._client.delete(self._uuid+json.dumps(k))
+            self._client.set(self._uuid+'keys', '')
+
+        def copy(self):
+            return type(self)(self.items())
+
+        def todict(self):
+            return dict(self.items())
 
     class NamespaceProxy(BaseProxy):
         def __init__(self, **kwargs):
@@ -1286,6 +1420,7 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
 
     SyncManager.register('list', ListProxy)
     SyncManager.register('dict', DictProxy)
+    SyncManager.register('dict1', DictProxy1)
     SyncManager.register('Namespace', NamespaceProxy)
     SyncManager.register('Lock', synchronize.Lock)
     SyncManager.register('RLock', synchronize.RLock)

@@ -25,6 +25,7 @@ install_requires = [
     'cloudpickle',
     'tblib',
     'ps-mem',
+    'pynng',
     'pymemcache'
 ]
 

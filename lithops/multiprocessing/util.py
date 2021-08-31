@@ -145,7 +145,7 @@ def setup_log_streaming(executor):
         return remote_logger, stream
     else:
         return None, None
-        
+
 if 'redis' in  mp_config.get_parameter(mp_config.CACHE):
 
     #
@@ -231,70 +231,6 @@ if 'redis' in  mp_config.get_parameter(mp_config.CACHE):
             if count < 0 and len(referenced) > 0:
                 client.delete(*referenced)
 
-
-    class RemoteLogIOBuffer:
-        def __init__(self, stream):
-            self._feeder_thread = threading
-            self._buff = io.StringIO()
-            self._client = get_cache_client()
-            self._stream = stream
-            self._offset = 0
-
-        def write(self, log):
-            self._buff.write(log)
-            # self.flush()
-            self._old_stdout.write(log)
-
-        def flush(self):
-            self._buff.seek(self._offset)
-            log = self._buff.read()
-            self._client.publish(self._stream, log)
-            self._offset = self._buff.tell()
-            # self._buff = io.StringIO()
-            # FIXME flush() does not empty the buffer?
-            self._buff.flush()
-
-        def start(self):
-            import sys
-            self._old_stdout = sys.stdout
-            sys.stdout = self
-            logger.debug('Starting remote logging feed to stream %s', self._stream)
-
-        def stop(self):
-            import sys
-            sys.stdout = self._old_stdout
-            logger.debug('Stopping remote logging feed to stream %s', self._stream)
-
-
-    class RemoteLoggingFeed:
-        def __init__(self, stream):
-            self._logger_thread = threading.Thread(target=self._logger_monitor, args=(stream,))
-            self._stream = stream
-            self._enabled = False
-
-        def _logger_monitor(self, stream):
-            debug('Starting logger monitor thread for stream {}'.format(stream))
-            cache_pubsub = get_cache_client().pubsub()
-            cache_pubsub.subscribe(stream)
-
-            while self._enabled:
-                msg = cache_pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
-                if msg is None:
-                    continue
-                if 'data' in msg:
-                    sys.stdout.write(msg['data'].decode('utf-8'))
-
-            debug('Logger monitor thread for stream {} finished'.format(stream))
-
-        def start(self):
-            # self._logger_thread.daemon = True
-            self._enabled = True
-            self._logger_thread.start()
-
-        def stop(self):
-            self._enabled = False
-            self._logger_thread.join(5)
-
 elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE):
 
     #
@@ -375,6 +311,73 @@ elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE):
                     self._client.delete(ref)
             pass
 
+
+if 'redis' in  mp_config.get_parameter(mp_config.CACHE) and mp_config.get_parameter(mp_config.AMQP) == '':
+
+
+    class RemoteLogIOBuffer:
+        def __init__(self, stream):
+            self._feeder_thread = threading
+            self._buff = io.StringIO()
+            self._client = get_cache_client()
+            self._stream = stream
+            self._offset = 0
+
+        def write(self, log):
+            self._buff.write(log)
+            # self.flush()
+            self._old_stdout.write(log)
+
+        def flush(self):
+            self._buff.seek(self._offset)
+            log = self._buff.read()
+            self._client.publish(self._stream, log)
+            self._offset = self._buff.tell()
+            # self._buff = io.StringIO()
+            # FIXME flush() does not empty the buffer?
+            self._buff.flush()
+
+        def start(self):
+            import sys
+            self._old_stdout = sys.stdout
+            sys.stdout = self
+            logger.debug('Starting remote logging feed to stream %s', self._stream)
+
+        def stop(self):
+            import sys
+            sys.stdout = self._old_stdout
+            logger.debug('Stopping remote logging feed to stream %s', self._stream)
+
+
+    class RemoteLoggingFeed:
+        def __init__(self, stream):
+            self._logger_thread = threading.Thread(target=self._logger_monitor, args=(stream,))
+            self._stream = stream
+            self._enabled = False
+
+        def _logger_monitor(self, stream):
+            logger.debug('Starting logger monitor thread for stream {}'.format(stream))
+            cache_pubsub = get_cache_client().pubsub()
+            cache_pubsub.subscribe(stream)
+
+            while self._enabled:
+                msg = cache_pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
+                if msg is None:
+                    continue
+                if 'data' in msg:
+                    sys.stdout.write(msg['data'].decode('utf-8'))
+
+            logger.debug('Logger monitor thread for stream {} finished'.format(stream))
+
+        def start(self):
+            # self._logger_thread.daemon = True
+            self._enabled = True
+            self._logger_thread.start()
+
+        def stop(self):
+            self._enabled = False
+            self._logger_thread.join(5)
+
 elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP) :
 
     class RemoteLogIOBuffer:
@@ -398,8 +401,7 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP) :
         def flush(self):
             self._buff.seek(self._offset)
             log = self._buff.read()
-            self._client.publish(self._stream, log)
-            self._client.basic_publish(exchange='exchange-'+self._stream,routing_key=self._stream,body=log)
+            self._channel.basic_publish(exchange='exchange-'+self._stream,routing_key=self._stream,body=log)
             self._offset = self._buff.tell()
             # self._buff = io.StringIO()
             # FIXME flush() does not empty the buffer?
@@ -430,26 +432,15 @@ elif 'rabbitmq' in  mp_config.get_parameter(mp_config.AMQP) :
             self._enabled = False
 
         def _logger_monitor(self, stream):
-            debug('Starting logger monitor thread for stream {}'.format(stream))
-            #cache_pubsub = get_cache_client().pubsub()
-            #cache_pubsub.subscribe(stream)
-            #while self._enabled:
-            #    msg = cache_pubsub.get_message(ignore_subscribe_messages=True, timeout=1)
-            #    if msg is None:
-            #        continue
-            global msg
-            msg = None
-            def callback(ch, method, properties, body):
-                global res
-                msg = body
-                ch.stop_consuming()
-            #self._channel.basic_qos(prefetch_count=1)
-            self._channel.basic_consume(queue=handle, on_message_callback=callback)
-            self._channel.start_consuming()
-            if 'data' in msg:
-                sys.stdout.write(msg['data'].decode('utf-8'))
+            while self._enabled:
+                method, properties, body  = self._channel.basic_get(queue=self._stream, auto_ack=False)
+                msg = body 
+                if msg is None:
+                    continue
+                else:
+                    sys.stdout.write(msg.decode('utf-8'))
 
-            debug('Logger monitor thread for stream {} finished'.format(stream))
+            logger.debug('Logger monitor thread for stream {} finished'.format(stream))
 
         def start(self):
             # self._logger_thread.daemon = True

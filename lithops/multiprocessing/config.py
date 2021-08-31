@@ -38,17 +38,20 @@ if 'redis' in load_config()['lithops']['cache'] :
         CACHE_EXPIRY_TIME: 3600,  # 1 hour
         PIPE_CONNECTION_TYPE: 'redislist',
         ENV_VARS: {},
-        EXPORT_EXECUTION_DETAILS: False
+        EXPORT_EXECUTION_DETAILS: False,
+        AMQP: ''
     }
+    
 elif 'memcached' in load_config()['lithops']['cache']:
     _DEFAULT_CONFIG = {
         CACHE: 'memcached',
         LITHOPS_CONFIG: {},
         STREAM_STDOUT: False,
         CACHE_EXPIRY_TIME: 3600,  # 1 hour
-        PIPE_CONNECTION_TYPE: 'nanomsgreqrep',
+        PIPE_CONNECTION_TYPE: 'memcached',
         ENV_VARS: {}, 
-        EXPORT_EXECUTION_DETAILS: False
+        EXPORT_EXECUTION_DETAILS: False,
+        AMQP: ''
     }
 
 try: 

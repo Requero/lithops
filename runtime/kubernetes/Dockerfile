@@ -27,7 +27,8 @@ RUN pip install --upgrade setuptools six pip \
         numpy \
         cloudpickle \
         ps-mem \
-        tblib
+        tblib \
+	pymemcache
 
 ENV PYTHONUNBUFFERED TRUE
 
