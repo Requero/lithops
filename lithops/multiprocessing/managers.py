@@ -736,6 +736,9 @@ if 'redis'in util. mp_config.get_parameter(mp_config.CACHE):
     SyncManager.register('Pool', pool.Pool, can_manage=False)
 
 elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
+
+    import mmh3
+
     def deslice(slic: slice):
         start = slic.start
         end = slic.stop
@@ -1245,9 +1248,11 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
             super().__init__('dict')
             #print(kwargs['kwargs'])
             keys = ''
+            self._client.set(self._uuid+'keys', keys)
             for k,v in kwargs.items():
-                keys = keys+','+self._uuid+json.dumps(k)
-                self._client.set(self._uuid+json.dumps(k), self._pickler.dumps(v))
+                key = self._uuid+json.dumps(k)
+                keys = keys+','+key
+                self._client.set(key, self._pickler.dumps(v))
 
             self._client.set(self._uuid+'keys', keys)
 
@@ -1255,8 +1260,12 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
             self._client.set(self._uuid+json.dumps(k), self._pickler.dumps(v))
             keys = self._client.get(self._uuid+'keys')
             keys = keys.decode('utf-8')
-            if json.dumps(k) not in keys:
-                self._client.append(self._uuid+'keys', ','+self._uuid+json.dumps(k))
+            key = self._uuid+json.dumps(k)
+            #print(keys)
+            #print(keys)
+            if  key not in keys:
+                print('aaaaa')
+                self._client.append(self._uuid+'keys', ','+key)
 
         def __getitem__(self, k):
             r = self._client.get(self._uuid+json.dumps(k))
@@ -1312,18 +1321,26 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
 
         def setdefault(self, k, default=None):
             res = self._client.get(self._uuid+json.dumps(k))
-            self._client.set(self._uuid+json.dumps(k), self._pickler.dumps(default))
+            ser = self._pickler.dumps(default)
+            self._client.set(self._uuid+json.dumps(k), ser)
             return res
 
         def update(self, kwargs):
             temp = dict(**kwargs)
             keys = self._client.get(self._uuid+'keys')
             keys = keys.decode('utf-8')
+            #print(keys)
+            #print(temp.items())
             for k,v in temp.items():
-                if k not  in keys:
-                    keys = keys+','+self._uuid+json.dumps(k)
-                self._client.set(self._uuid+json.dumps(k), self._pickler.dumps(v))
+                key = self._uuid+json.dumps(k)
+                if key not in keys:
+                    #print(key)
+                    keys = keys+','+key
+                ser = self._pickler.dumps(v)
+                self._client.set(key, ser)
+            #print(keys)
             self._client.set(self._uuid+'keys', keys)
+
 
         def keys(self):
             ks = self._client.get(self._uuid+'keys').decode('utf-8').replace(self._uuid,'').split(',')[1:]
@@ -1337,9 +1354,15 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
 
         def items(self):
             keys = self._client.get(self._uuid+'keys')
-            keys = keys.decode('utf-8').split(',')[1:]
+            keys = keys.decode('utf-8').split(',')
+            keys = keys[1:]
+            #print(keys)
+            #keys = [bytes(k, 'ascii') for k in keys]
+            #print(keys)
             temp = self._client.get_many(keys)
+            #print(temp)
             l = [(json.loads(k.replace(self._uuid,'')),self._pickler.loads(v)) for k,v in temp.items()]
+            #print(l)
             return l
 
         def clear(self):
@@ -1421,8 +1444,8 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
         """
 
     SyncManager.register('list', ListProxy)
-    SyncManager.register('dict', DictProxy)
-    SyncManager.register('dict1', DictProxy1)
+    SyncManager.register('dict1', DictProxy)
+    SyncManager.register('dict', DictProxy1)
     SyncManager.register('Namespace', NamespaceProxy)
     SyncManager.register('Lock', synchronize.Lock)
     SyncManager.register('RLock', synchronize.RLock)

@@ -91,7 +91,7 @@ def get_amqp_client(**overwrites):
         raise Exception('None cache section not found in you config')
     conn_params.update(overwrites)
 
-    if 'rabbitmq' in mp_config.get_parameter(mp_config.CACHE) :
+    if 'rabbitmq' in mp_config.get_parameter(mp_config.AMQP) :
         return pika.URLParameters(conn_params['amqp_url'])
 #
 # Helper functions
