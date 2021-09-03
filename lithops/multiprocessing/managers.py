@@ -1243,9 +1243,9 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
 
         def __init__(self, **kwargs):
             super().__init__('dict')
-            temp = dict(**kwargs)
+            #print(kwargs['kwargs'])
             keys = ''
-            for k,v in temp.items():
+            for k,v in kwargs.items():
                 keys = keys+','+self._uuid+json.dumps(k)
                 self._client.set(self._uuid+json.dumps(k), self._pickler.dumps(v))
 
@@ -1320,7 +1320,8 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
             keys = self._client.get(self._uuid+'keys')
             keys = keys.decode('utf-8')
             for k,v in temp.items():
-                keys = keys+','+self._uuid+json.dumps(k)
+                if k not  in keys:
+                    keys = keys+','+self._uuid+json.dumps(k)
                 self._client.set(self._uuid+json.dumps(k), self._pickler.dumps(v))
             self._client.set(self._uuid+'keys', keys)
 
@@ -1338,7 +1339,8 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
             keys = self._client.get(self._uuid+'keys')
             keys = keys.decode('utf-8').split(',')[1:]
             temp = self._client.get_many(keys)
-            return [(json.loads(k.replace(self._uuid,'')),self._pickler.loads(v)) for k,v in temp.items()]
+            l = [(json.loads(k.replace(self._uuid,'')),self._pickler.loads(v)) for k,v in temp.items()]
+            return l
 
         def clear(self):
             keys = self._client.get(self._uuid+'keys')
