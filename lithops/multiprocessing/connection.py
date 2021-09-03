@@ -974,9 +974,6 @@ elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE) and util.mp_config
 
         def _recv_bytes(self, maxsize=None):
             chunk = self._buff.get()
-            #self._client.set(self._subhandle+'list', cloudpickle.dumps(self._buff_list))
-            #chunk = self._buff_queue.get()
-            #self._buff_list.pop()
             
             self._client.decr(self._subhandle+'len',1)
             return chunk
@@ -991,7 +988,7 @@ elif 'memcached' in  mp_config.get_parameter(mp_config.CACHE) and util.mp_config
                     time.sleep(0.1)
             return False
     
-    PipeConnection = _NanomsgConnection
+    PipeConnection = _MemcachedConnection
     #PipeConnection = _MemcachedConnection
     def wait_memcached(object_list, timeout=None):
         """

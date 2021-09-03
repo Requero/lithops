@@ -1338,7 +1338,7 @@ elif 'memcached' in util. mp_config.get_parameter(mp_config.CACHE):
             keys = self._client.get(self._uuid+'keys')
             keys = keys.decode('utf-8').split(',')[1:]
             temp = self._client.get_many(keys)
-            return [(k,self._pickler.loads(v)) for k,v in temp.items()]
+            return [(json.loads(k.replace(self._uuid,'')),self._pickler.loads(v)) for k,v in temp.items()]
 
         def clear(self):
             keys = self._client.get(self._uuid+'keys')
